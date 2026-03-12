@@ -106,27 +106,18 @@ async def _bootstrap(sandbox) -> None:
         if "__pycache__" not in p.parts and ".venv" not in p.parts
     ]
 
-    # Install deps and create workspace dir in parallel.
-    # Use `python3 -m pip` to ensure packages land in the same environment
-    # that runs `python3` — plain `pip` may target a different interpreter.
-    await asyncio.gather(
-        _aexec(sandbox, f"mkdir -p {_WORKSPACE}"),
-        _aexec(sandbox, f"python3 -m pip install -q {' '.join(_SANDBOX_DEPS)}"),
-    )
+    # Step 1: create workspace dir
+    await sandbox.process.exec(f"mkdir -p {_WORKSPACE}", timeout=30)
 
-    # Write each source file individually via exec (one per file, small
-    # command ≈6-10 KB each). This lands files in the REAL sandbox filesystem
-    # accessible to all subsequent `exec`-based code runs.
+    # Step 2: write all source files in parallel
     async def _write_file(dest: str, b64: str) -> None:
-        # Two separate calls: mkdir then write.
-        # Avoids && chaining and escaping issues in minimal sandbox shells.
         dir_path = dest.rsplit("/", 1)[0]
-        await _aexec(sandbox, f"mkdir -p {dir_path}")
+        await sandbox.process.exec(f"mkdir -p {dir_path}", timeout=30)
         write_cmd = (
             f"python3 -c \"import base64; "
             f"open('{dest}','wb').write(base64.b64decode('{b64}'))\""
         )
-        await _aexec(sandbox, write_cmd)
+        await sandbox.process.exec(write_cmd, timeout=30)
 
     write_tasks = [
         _write_file(
@@ -137,9 +128,21 @@ async def _bootstrap(sandbox) -> None:
     ]
     await asyncio.gather(*write_tasks)
 
-    # Verify files landed in the sandbox filesystem
-    check = await _aexec(sandbox, f"ls {_WORKSPACE}/app/ 2>&1 | head -5")
-    logger.info("Sandbox bootstrapped: %d files | app/ contents: %s", len(py_files), check.strip())
+    # Step 3: install deps AFTER files land — use timeout=0 to wait as long as needed
+    deps_str = " ".join(_SANDBOX_DEPS)
+    pip_result = await sandbox.process.exec(
+        f"python3 -m pip install {deps_str} 2>&1",
+        timeout=0,
+    )
+    pip_out = (getattr(pip_result, "output", "") or getattr(pip_result, "result", "") or "").strip()
+    pip_exit = getattr(pip_result, "exit_code", None)
+    logger.info("pip install exit=%s output=%s", pip_exit, pip_out[-300:] if pip_out else "(none)")
+    if pip_exit and pip_exit != 0:
+        raise RuntimeError(f"pip install failed (exit {pip_exit}): {pip_out[-500:]}")
+
+    check = await sandbox.process.exec(f"ls {_WORKSPACE}/app/ 2>&1 | head -5", timeout=30)
+    logger.info("Sandbox bootstrapped: %d files | app/ contents: %s", len(py_files),
+                (getattr(check, "output", "") or "").strip())
 
 
 # ─── Code template helpers ────────────────────────────────────────────────────
