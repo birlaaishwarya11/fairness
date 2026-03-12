@@ -106,27 +106,29 @@ async def _acode_run(sandbox, code: str) -> str:
         f"python3 -c \"import base64; "
         f"open('{tmp}','w').write(base64.b64decode('{encoded}').decode())\""
     )
-    await sandbox.process.exec(write_cmd)
+    await sandbox.process.exec(write_cmd, timeout=30)
     # Step 2: run the temp file with PYTHONPATH set.
     # timeout=0 means no timeout — phase scripts call LLMs and can take 60-180s.
     # Without this, Daytona's default aiohttp timeout kills the exec mid-flight.
     run_cmd = f"env PYTHONPATH={_WORKSPACE} python3 {tmp} 2>&1"
-    result = await sandbox.process.exec(run_cmd, timeout=0)
+    result = await sandbox.process.exec(run_cmd, timeout=None)
     return getattr(result, "output", "") or getattr(result, "result", "") or ""
 
 
 # ─── Sandbox bootstrap ────────────────────────────────────────────────────────
 
-async def _bootstrap(sandbox):
+async def _bootstrap(sandbox, install_deps: bool = True):
     """
-    Install deps + upload all project Python source files.
+    Upload all project Python source files, and optionally install deps.
     Yields progress dicts that the caller can forward as SSE events.
 
     Files are written SEQUENTIALLY — one exec call per file, keeping each
     command small (<15 KB). Parallel or large-batch approaches hit Daytona
     exec command-length/concurrency limits and silently drop writes.
+
+    install_deps=False for worker sandboxes — they share the same Python
+    environment snapshot so pip install is not needed, saving 30-60s per worker.
     """
-    from typing import AsyncGenerator
     py_files = [
         p for p in _PROJECT_ROOT.rglob("*.py")
         if "__pycache__" not in p.parts and ".venv" not in p.parts
@@ -157,14 +159,15 @@ async def _bootstrap(sandbox):
             yield {"phase": "sandbox", "status": "uploading", "message": f"Uploaded {i}/{total} files", "done": i, "total": total}
 
     logger.info("Wrote %d source files to sandbox", total)
-    yield {"phase": "sandbox", "status": "installing", "message": "Installing dependencies…"}
 
-    deps_str = " ".join(_SANDBOX_DEPS)
-    pip_out = await _aexec(sandbox, f"python3 -m pip install -q {deps_str} 2>&1")
-    logger.info("pip install: %s", pip_out.strip()[-300:] if pip_out.strip() else "ok")
+    if install_deps:
+        yield {"phase": "sandbox", "status": "installing", "message": "Installing dependencies…"}
+        deps_str = " ".join(_SANDBOX_DEPS)
+        pip_out = await _aexec(sandbox, f"python3 -m pip install -q {deps_str} 2>&1")
+        logger.info("pip install: %s", pip_out.strip()[-300:] if pip_out.strip() else "ok")
 
     check = await _aexec(sandbox, f"ls {_WORKSPACE}/app/ 2>&1 | head -10")
-    logger.info("Sandbox bootstrapped: %d files | app/ contents: %s", total, check.strip())
+    logger.info("Sandbox bootstrapped (deps=%s): %d files | app/ contents: %s", install_deps, total, check.strip())
 
 
 # ─── Code template helpers ────────────────────────────────────────────────────
@@ -243,15 +246,18 @@ _result = asyncio.run(_run())
 
 
 def _plan_code(req: RedTeamRequest, recon_data: dict, env: str) -> str:
-    audit_cfg_repr = repr(req.audit_config.model_dump() if req.audit_config else None)
+    import json as _json
+    audit_cfg_json = _json.dumps(req.audit_config.model_dump(mode="json") if req.audit_config else None)
+    recon_json = _json.dumps(recon_data)
     body = f"""
+import json as _json
 from app.agents.planner_agent import run_planning
 from app.models.schemas import ReconReport, Depth, AuditConfig
 
 async def _run():
-    recon = ReconReport.model_validate({repr(recon_data)})
-    _cfg_raw = {audit_cfg_repr}
-    audit_config = AuditConfig.model_validate(_cfg_raw) if _cfg_raw else None
+    recon = ReconReport.model_validate(_json.loads({repr(recon_json)}))
+    _cfg_raw = _json.loads({repr(audit_cfg_json)})
+    audit_config = AuditConfig.model_validate(_cfg_raw) if _cfg_raw is not None else None
     plan = await run_planning(recon, Depth({repr(req.depth.value)}), audit_config)
     return plan.model_dump_json()
 
@@ -266,8 +272,12 @@ def _suite_code(
     recon_data: dict,
     env: str,
 ) -> str:
-    audit_cfg_repr = repr(req.audit_config.model_dump() if req.audit_config else None)
+    import json as _json
+    audit_cfg_json = _json.dumps(req.audit_config.model_dump(mode="json") if req.audit_config else None)
+    recon_json = _json.dumps(recon_data)
+    suite_json = _json.dumps(suite_data)
     body = f"""
+import json as _json
 from app.agents.attacker_agent import generate_probes
 from app.agents.executor_agent import execute_probes_batch
 from app.agents.judge_agent import judge_suite
@@ -276,10 +286,10 @@ from app.models.schemas import TestSuite, ReconReport, AuditConfig
 _SUITE_TIMEOUT = 240  # 4 minutes max per suite — prevents hangs on rate limits
 
 async def _run():
-    suite = TestSuite.model_validate({repr(suite_data)})
-    recon = ReconReport.model_validate({repr(recon_data)})
-    _cfg_raw = {audit_cfg_repr}
-    audit_config = AuditConfig.model_validate(_cfg_raw) if _cfg_raw else None
+    suite = TestSuite.model_validate(_json.loads({repr(suite_json)}))
+    recon = ReconReport.model_validate(_json.loads({repr(recon_json)}))
+    _cfg_raw = _json.loads({repr(audit_cfg_json)})
+    audit_config = AuditConfig.model_validate(_cfg_raw) if _cfg_raw is not None else None
 
     probes = await generate_probes(suite, recon, audit_config)
     pairs = await execute_probes_batch(
@@ -345,8 +355,8 @@ async def _provision_worker(req: RedTeamRequest) -> tuple:
     daytona = _make_client()
     sandbox = await daytona.create(CreateSandboxFromSnapshotParams(language="python"))
     logger.info("Worker sandbox created: id=%s", getattr(sandbox, "id", "?"))
-    async for _ in _bootstrap(sandbox):
-        pass  # bootstrap progress consumed silently for workers
+    async for _ in _bootstrap(sandbox, install_deps=False):
+        pass  # bootstrap progress consumed silently for workers (no pip install)
     logger.info("Worker sandbox ready: id=%s", getattr(sandbox, "id", "?"))
     return daytona, sandbox
 
@@ -388,7 +398,8 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
     """
     daytona = _make_client()
     orch_sandbox = None
-    worker_pool: list[tuple] = []  # list of (daytona_client, sandbox)
+    worker_pool: list[tuple] = []       # list of (daytona_client, sandbox)
+    worker_tasks: list[asyncio.Task] = []  # tracked so finally can cancel + teardown
 
     try:
         # ── Provision orchestrator sandbox ────────────────────────────────────
@@ -410,7 +421,7 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
             return results
 
         orch_bootstrap_task = asyncio.ensure_future(_bootstrap_orch())
-        worker_tasks = [asyncio.ensure_future(_provision_worker(req)) for _ in range(n_workers)]
+        worker_tasks[:] = [asyncio.ensure_future(_provision_worker(req)) for _ in range(n_workers)]
 
         # Stream orchestrator bootstrap progress while workers spin up silently
         bootstrap_results = await orch_bootstrap_task
@@ -555,7 +566,22 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
         yield _sse({"phase": "error", "status": "error", "error": str(exc)})
 
     finally:
-        # Tear down orchestrator sandbox
+        # ── Cancel any in-flight worker provisioning tasks ─────────────────────
+        # If an exception fires before asyncio.gather() resolves, worker sandboxes
+        # may have been created but not yet returned into worker_pool — cancel the
+        # tasks and collect whatever completed so we can delete those sandboxes too.
+        for t in worker_tasks:
+            if not t.done():
+                t.cancel()
+        for t in worker_tasks:
+            try:
+                result = await t  # may raise CancelledError or provision error
+                if result not in worker_pool:
+                    worker_pool.append(result)
+            except Exception:
+                pass  # task cancelled or provisioning failed — nothing to teardown
+
+        # ── Tear down orchestrator sandbox ─────────────────────────────────────
         if orch_sandbox is not None:
             try:
                 await daytona.delete(orch_sandbox)
@@ -566,6 +592,7 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
             await daytona.close()
         except Exception:
             pass
-        # Tear down all worker sandboxes
+        # ── Tear down all remaining worker sandboxes ───────────────────────────
         for w_daytona, w_sandbox in worker_pool:
             await _teardown_worker(w_daytona, w_sandbox)
+        logger.info("Cleanup complete — all sandboxes removed.")
