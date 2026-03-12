@@ -107,9 +107,11 @@ async def _acode_run(sandbox, code: str) -> str:
         f"open('{tmp}','w').write(base64.b64decode('{encoded}').decode())\""
     )
     await sandbox.process.exec(write_cmd)
-    # Step 2: run the temp file with PYTHONPATH set
+    # Step 2: run the temp file with PYTHONPATH set.
+    # timeout=0 means no timeout — phase scripts call LLMs and can take 60-180s.
+    # Without this, Daytona's default aiohttp timeout kills the exec mid-flight.
     run_cmd = f"env PYTHONPATH={_WORKSPACE} python3 {tmp} 2>&1"
-    result = await sandbox.process.exec(run_cmd)
+    result = await sandbox.process.exec(run_cmd, timeout=0)
     return getattr(result, "output", "") or getattr(result, "result", "") or ""
 
 
