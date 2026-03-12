@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 import httpx
@@ -24,6 +25,15 @@ logger = logging.getLogger(__name__)
 _TIMEOUT = 30.0       # per-request httpx timeout — fail fast, don't hang suites
 _MAX_RETRIES = 1      # one retry only; more retries cause 270s+ hangs under rate limits
 _RETRY_DELAYS = [5]   # single delay before the one retry
+
+# ── Groq rate-limit guard ─────────────────────────────────────────────────────
+# Groq free tier = 30 RPM on llama-3.3-70b-versatile.
+# A global semaphore caps concurrent fairsight-internal calls to 2, and a
+# minimum inter-call interval of 2.1 s keeps throughput ≤ 28 RPM (safe margin).
+# This only applies to Groq endpoints — other providers are uncapped.
+_GROQ_SEMAPHORE = asyncio.Semaphore(2)
+_GROQ_LAST_CALL: float = 0.0
+_GROQ_MIN_INTERVAL: float = 2.1  # seconds → ~28 RPM
 
 
 class RateLimitError(Exception):
@@ -45,6 +55,21 @@ _MODEL_ENDPOINTS: list[tuple[str, str]] = [
     ("qwen",      "https://api.groq.com/openai/v1/chat/completions"),
     ("groq",      "https://api.groq.com/openai/v1/chat/completions"),
 ]
+
+
+def _is_groq_endpoint(endpoint: str) -> bool:
+    return "groq.com" in endpoint
+
+
+async def _groq_rate_limit() -> None:
+    """Acquire the Groq semaphore and enforce a minimum inter-call interval."""
+    global _GROQ_LAST_CALL
+    async with _GROQ_SEMAPHORE:
+        wait = _GROQ_MIN_INTERVAL - (time.monotonic() - _GROQ_LAST_CALL)
+        if wait > 0:
+            logger.debug("Groq rate limiter: sleeping %.2fs", wait)
+            await asyncio.sleep(wait)
+        _GROQ_LAST_CALL = time.monotonic()
 
 
 def default_endpoint(model: str) -> str:
@@ -186,6 +211,9 @@ async def _call_openai_compat(
     endpoint: str,
 ) -> str:
     """Call any OpenAI-compatible REST API via httpx."""
+    if _is_groq_endpoint(endpoint):
+        await _groq_rate_limit()
+
     payload_messages: list[dict] = []
     if system:
         payload_messages.append({"role": "system", "content": system})
