@@ -389,15 +389,33 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
 
         pending = set(suite_futures.keys())
         exec_elapsed = 0
+        rate_limit_detected = False
         while pending:
             done, pending = await asyncio.wait(
                 pending, return_when=asyncio.FIRST_COMPLETED, timeout=10.0
             )
             if not done:
-                # Timeout — no suite finished yet, emit heartbeat
                 exec_elapsed += 10
-                yield _sse({"phase": "execution", "status": "running",
-                             "message": f"Suites running… ({exec_elapsed}s elapsed, {len(pending)} remaining)"})
+                # After 60s with no completion, likely rate-limited
+                if exec_elapsed >= 60 and not rate_limit_detected:
+                    rate_limit_detected = True
+                    yield _sse({
+                        "phase": "execution",
+                        "status": "rate_limited",
+                        "message": (
+                            f"Rate limiting detected — the target model is throttling requests. "
+                            f"Retrying automatically… ({exec_elapsed}s elapsed, {len(pending)} suites remaining)"
+                        ),
+                    })
+                elif rate_limit_detected:
+                    yield _sse({
+                        "phase": "execution",
+                        "status": "rate_limited",
+                        "message": f"Still retrying after rate limit… ({exec_elapsed}s elapsed, {len(pending)} suites remaining)",
+                    })
+                else:
+                    yield _sse({"phase": "execution", "status": "running",
+                                 "message": f"Suites running… ({exec_elapsed}s elapsed, {len(pending)} remaining)"})
             for fut in done:
                 suite = suite_futures[fut]
                 try:
@@ -411,15 +429,18 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
                         "data": result,
                     })
                 except Exception as exc:
-                    logger.error(
-                        "Suite '%s' failed in sandbox: %s",
-                        suite.get("suite_name"), exc,
-                    )
+                    err_str = str(exc)
+                    is_timeout = "TimeoutError" in err_str or "timed out" in err_str.lower()
+                    logger.error("Suite '%s' failed: %s", suite.get("suite_name"), exc)
                     yield _sse({
                         "phase": "execution",
                         "suite": suite.get("suite_name"),
                         "status": "error",
-                        "error": str(exc),
+                        "error": (
+                            "Suite timed out — likely caused by API rate limiting. "
+                            "Consider using a higher-tier API key or retrying."
+                        ) if is_timeout else err_str,
+                        "rate_limited": is_timeout,
                     })
 
         # ── Phase 4: Report ───────────────────────────────────────────────────

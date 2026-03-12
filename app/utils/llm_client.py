@@ -97,6 +97,9 @@ async def _post_with_retry(
                 int(resp.headers.get("retry-after", _RETRY_DELAYS[min(attempt - 1, len(_RETRY_DELAYS) - 1)])),
                 30,
             )
+            if resp.status_code == 429:
+                # Print structured line so sandbox stdout surfaces it as an SSE hint
+                print(f"FAIRSIGHT_RATE_LIMITED: model={model} retry_in={retry_after}s attempt={attempt}", flush=True)
             logger.warning(
                 "LLM HTTP %d (attempt %d) — retrying in %ds",
                 resp.status_code, attempt, retry_after,
