@@ -95,26 +95,28 @@ async def _acode_run(sandbox, code: str) -> str:
 
 # ─── Sandbox bootstrap ────────────────────────────────────────────────────────
 
-async def _bootstrap(sandbox) -> None:
+async def _bootstrap(sandbox):
     """
     Install deps + upload all project Python source files.
-    This is done once per sandbox, before any phase runs.
+    Yields progress dicts that the caller can forward as SSE events.
 
     Files are written SEQUENTIALLY — one exec call per file, keeping each
     command small (<15 KB). Parallel or large-batch approaches hit Daytona
     exec command-length/concurrency limits and silently drop writes.
     """
-    # Collect all .py files (skip __pycache__ and .venv)
+    from typing import AsyncGenerator
     py_files = [
         p for p in _PROJECT_ROOT.rglob("*.py")
         if "__pycache__" not in p.parts and ".venv" not in p.parts
     ]
+    total = len(py_files)
+
+    yield {"phase": "sandbox", "status": "uploading", "message": f"Uploading {total} source files…", "done": 0, "total": total}
 
     await _aexec(sandbox, f"mkdir -p {_WORKSPACE}")
 
-    # Write files sequentially; mkdir only once per unique directory.
     dirs_created: set[str] = set()
-    for p in py_files:
+    for i, p in enumerate(py_files, 1):
         dest = f"{_WORKSPACE}/{p.relative_to(_PROJECT_ROOT)}"
         dir_path = dest.rsplit("/", 1)[0]
         if dir_path not in dirs_created:
@@ -128,18 +130,19 @@ async def _bootstrap(sandbox) -> None:
         )
         if out.strip():
             logger.warning("Write %s stderr: %s", dest, out.strip())
+        # Emit progress every 5 files (and on the last one)
+        if i % 5 == 0 or i == total:
+            yield {"phase": "sandbox", "status": "uploading", "message": f"Uploaded {i}/{total} files", "done": i, "total": total}
 
-    logger.info("Wrote %d source files to sandbox", len(py_files))
+    logger.info("Wrote %d source files to sandbox", total)
+    yield {"phase": "sandbox", "status": "installing", "message": "Installing dependencies…"}
 
-    # Install Python deps
     deps_str = " ".join(_SANDBOX_DEPS)
-    pip_out = await _aexec(
-        sandbox, f"python3 -m pip install -q {deps_str} 2>&1"
-    )
+    pip_out = await _aexec(sandbox, f"python3 -m pip install -q {deps_str} 2>&1")
     logger.info("pip install: %s", pip_out.strip()[-300:] if pip_out.strip() else "ok")
 
     check = await _aexec(sandbox, f"ls {_WORKSPACE}/app/ 2>&1 | head -10")
-    logger.info("Sandbox bootstrapped: %d files | app/ contents: %s", len(py_files), check.strip())
+    logger.info("Sandbox bootstrapped: %d files | app/ contents: %s", total, check.strip())
 
 
 # ─── Code template helpers ────────────────────────────────────────────────────
@@ -320,7 +323,8 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
         logger.info("Sandbox created: id=%s", getattr(sandbox, "id", "?"))
 
         yield _sse({"phase": "sandbox", "status": "bootstrapping"})
-        await _bootstrap(sandbox)
+        async for progress in _bootstrap(sandbox):
+            yield _sse(progress)
         yield _sse({"phase": "sandbox", "status": "ready"})
 
         env = _env_setup(req)

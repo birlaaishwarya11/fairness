@@ -230,7 +230,20 @@ def run_test(args: argparse.Namespace) -> None:
                     elapsed = time.time() - start
 
                     if phase == "sandbox":
-                        print(f"[{elapsed:6.1f}s] SANDBOX : {status}")
+                        msg = event.get("message", "")
+                        done = event.get("done")
+                        total = event.get("total")
+                        if done is not None and total:
+                            bar_len = 20
+                            filled = int(bar_len * done / total)
+                            bar = "█" * filled + "░" * (bar_len - filled)
+                            print(f"\r[{elapsed:6.1f}s] SANDBOX : [{bar}] {done}/{total} files", end="", flush=True)
+                            if done == total:
+                                print()  # newline after last file
+                        elif msg:
+                            print(f"[{elapsed:6.1f}s] SANDBOX : {msg}")
+                        else:
+                            print(f"[{elapsed:6.1f}s] SANDBOX : {status}")
 
                     elif phase == "recon" and status == "complete":
                         data = event.get("data", {})
