@@ -91,7 +91,12 @@ async def _post_with_retry(
 
         if resp.status_code in (429, 500, 502, 503, 504) and attempt < _MAX_RETRIES:
             attempt += 1
-            retry_after = int(resp.headers.get("retry-after", _RETRY_DELAYS[min(attempt - 1, len(_RETRY_DELAYS) - 1)]))
+            # Cap retry-after at 30s — providers sometimes return 60s+ which
+            # causes suites to hang for minutes when rate-limited.
+            retry_after = min(
+                int(resp.headers.get("retry-after", _RETRY_DELAYS[min(attempt - 1, len(_RETRY_DELAYS) - 1)])),
+                30,
+            )
             logger.warning(
                 "LLM HTTP %d (attempt %d) — retrying in %ds",
                 resp.status_code, attempt, retry_after,

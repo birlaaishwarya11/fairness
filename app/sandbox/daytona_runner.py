@@ -269,6 +269,8 @@ from app.agents.executor_agent import execute_probes_batch
 from app.agents.judge_agent import judge_suite
 from app.models.schemas import TestSuite, ReconReport
 
+_SUITE_TIMEOUT = 240  # 4 minutes max per suite — prevents hangs on rate limits
+
 async def _run():
     suite = TestSuite.model_validate({repr(suite_data)})
     recon = ReconReport.model_validate({repr(recon_data)})
@@ -284,7 +286,7 @@ async def _run():
     result = await judge_suite(suite, pairs)
     return result.model_dump_json()
 
-_result = asyncio.run(_run())
+_result = asyncio.run(asyncio.wait_for(_run(), timeout=_SUITE_TIMEOUT))
 """
     return _phase_code(env, body.strip())
 
