@@ -450,22 +450,35 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
 
         suite_results: list[dict] = []
 
-        # Pair each suite with a worker (extras released, shortfall uses orch sandbox)
+        # Track which worker (daytona, sandbox) belongs to each future so we
+        # can tear it down immediately when its suite completes — freeing disk ASAP.
+        # overflow suites run on the orchestrator sandbox (no dedicated worker to tear down).
         suite_worker_pairs = list(zip(suites, worker_pool))
-        overflow_suites = suites[len(worker_pool):]  # run on orch sandbox if more suites than workers
+        overflow_suites = suites[len(worker_pool):]
+        # worker_pool entries that didn't get a suite (depth > actual suites generated)
+        extra_workers = worker_pool[len(suites):]
+
+        # Tear down extra workers immediately — they won't be used
+        for w_day, w_sb in extra_workers:
+            asyncio.ensure_future(_teardown_worker(w_day, w_sb))
+        worker_pool = worker_pool[:len(suites)]  # keep only what we're using
 
         suite_futures: dict[asyncio.Future, dict] = {}
+        fut_to_worker: dict[asyncio.Future, tuple | None] = {}  # None = orch sandbox (don't teardown)
+
         for suite, (w_daytona, w_sandbox) in suite_worker_pairs:
             fut = asyncio.ensure_future(
                 _run_suite_on_worker(req, suite, recon_data, w_daytona, w_sandbox)
             )
             suite_futures[fut] = suite
+            fut_to_worker[fut] = (w_daytona, w_sandbox)
 
         for suite in overflow_suites:
             fut = asyncio.ensure_future(
                 _run_suite_on_worker(req, suite, recon_data, daytona, orch_sandbox)
             )
             suite_futures[fut] = suite
+            fut_to_worker[fut] = None  # orchestrator sandbox — don't tear down mid-pipeline
 
         pending = set(suite_futures.keys())
         exec_elapsed = 0
@@ -497,6 +510,13 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
 
             for fut in done:
                 suite = suite_futures[fut]
+                # Tear down this suite's worker immediately to free disk space
+                worker_pair = fut_to_worker.get(fut)
+                if worker_pair is not None:
+                    asyncio.ensure_future(_teardown_worker(*worker_pair))
+                    # Remove from worker_pool so finally block doesn't double-teardown
+                    if worker_pair in worker_pool:
+                        worker_pool.remove(worker_pair)
                 try:
                     result = fut.result()
                     suite_results.append(result)

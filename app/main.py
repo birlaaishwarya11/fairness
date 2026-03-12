@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from app.models.schemas import FinalReport, RedTeamRequest
-from app.sandbox.daytona_runner import run_pipeline_in_sandbox
+from app.sandbox.daytona_runner import run_pipeline_in_sandbox, _make_client
 
 load_dotenv()
 
@@ -162,3 +162,75 @@ async def health():
         "version": "1.0.0",
         "reports_in_memory": len(_reports),
     }
+
+
+# ─── Admin: sandbox cleanup ────────────────────────────────────────────────────
+
+@app.get("/admin/sandboxes", summary="List all active Daytona sandboxes")
+async def list_sandboxes():
+    """List all sandboxes in your Daytona account with their IDs and state."""
+    daytona = _make_client()
+    try:
+        sandboxes = await daytona.list()
+        return {
+            "count": len(sandboxes),
+            "sandboxes": [
+                {
+                    "id": getattr(s, "id", "?"),
+                    "state": getattr(s, "state", "?"),
+                    "created_at": str(getattr(s, "created_at", "?")),
+                }
+                for s in sandboxes
+            ],
+        }
+    finally:
+        try:
+            await daytona.close()
+        except Exception:
+            pass
+
+
+@app.delete("/admin/sandboxes", summary="Delete ALL active Daytona sandboxes")
+async def delete_all_sandboxes():
+    """
+    Bulk-delete every sandbox in your Daytona account.
+    Use this to recover disk space after failed or stuck runs.
+    """
+    daytona = _make_client()
+    deleted, failed = 0, 0
+    try:
+        sandboxes = await daytona.list()
+        for s in sandboxes:
+            sid = getattr(s, "id", None)
+            try:
+                await daytona.delete(s)
+                logger.info("Admin: deleted sandbox %s", sid)
+                deleted += 1
+            except Exception as exc:
+                logger.warning("Admin: could not delete sandbox %s: %s", sid, exc)
+                failed += 1
+        return {"deleted": deleted, "failed": failed, "total": len(sandboxes)}
+    finally:
+        try:
+            await daytona.close()
+        except Exception:
+            pass
+
+
+@app.delete("/admin/sandboxes/{sandbox_id}", summary="Delete a specific Daytona sandbox")
+async def delete_sandbox(sandbox_id: str):
+    """Delete a single sandbox by ID."""
+    daytona = _make_client()
+    try:
+        sandboxes = await daytona.list()
+        target = next((s for s in sandboxes if getattr(s, "id", None) == sandbox_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail=f"Sandbox '{sandbox_id}' not found.")
+        await daytona.delete(target)
+        logger.info("Admin: deleted sandbox %s", sandbox_id)
+        return {"deleted": sandbox_id}
+    finally:
+        try:
+            await daytona.close()
+        except Exception:
+            pass
