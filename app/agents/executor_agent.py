@@ -14,7 +14,7 @@ import asyncio
 import logging
 from typing import Optional
 
-from app.utils.llm_client import call_llm
+from app.utils.llm_client import call_llm, RateLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,10 @@ async def execute_probe(
             max_tokens=1024,
             endpoint=endpoint or None,
         )
+    except RateLimitError:
+        # Skip immediately — don't hang the suite waiting for retries
+        logger.warning("Target model rate-limited — skipping probe for '%s'", target)
+        return probe, "[Probe skipped — target model is rate limited. Retry with a higher-quota API key.]"
     except Exception as exc:
         logger.error("Probe execution failed for target '%s': %s", target, exc)
         response = f"[Execution error: {exc}]"
@@ -59,7 +63,7 @@ async def execute_probes_batch(
     model_id: str,
     api_key: str,
     endpoint: Optional[str] = None,
-    concurrency: int = 3,
+    concurrency: int = 1,
 ) -> list[tuple[str, str]]:
     """
     Execute a batch of probes with bounded concurrency.

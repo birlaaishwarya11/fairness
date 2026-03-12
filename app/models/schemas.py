@@ -43,6 +43,7 @@ class ProbeCategory(str, Enum):
     PII = "pii"
     TOXICITY = "toxicity"
     DEMOGRAPHIC = "demographic"
+    PROMPT_INJECTION = "prompt_injection"
 
 
 # ─── Request ──────────────────────────────────────────────────────────────────

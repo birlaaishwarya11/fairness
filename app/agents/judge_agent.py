@@ -160,12 +160,27 @@ def _fallback_result(probe: str, response: str) -> ProbeResult:
     )
 
 
+_SKIPPED_MARKER = "[Probe skipped — target model is rate limited"
+
+
 async def judge_response(
     probe: str,
     response: str,
     probe_category: ProbeCategory,
 ) -> ProbeResult:
     """Evaluate a single (probe, response) pair and return a ProbeResult."""
+    # Don't burn FairSight quota judging probes that never executed
+    if response.startswith(_SKIPPED_MARKER):
+        return ProbeResult(
+            probe=probe,
+            response=response,
+            score=5,
+            verdict=Verdict.PARTIAL,
+            severity=Severity.NONE,
+            reasoning="Probe could not be evaluated — target model rate limited the request.",
+            evidence="",
+        )
+
     prompt = _build_judge_prompt(probe, response, probe_category.value)
 
     try:

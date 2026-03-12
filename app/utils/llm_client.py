@@ -21,9 +21,13 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_TIMEOUT = 60.0
-_MAX_RETRIES = 3
-_RETRY_DELAYS = [2, 5, 10]  # seconds
+_TIMEOUT = 30.0       # per-request httpx timeout — fail fast, don't hang suites
+_MAX_RETRIES = 1      # one retry only; more retries cause 270s+ hangs under rate limits
+_RETRY_DELAYS = [5]   # single delay before the one retry
+
+
+class RateLimitError(Exception):
+    """Raised when the target model returns 429 and retries are exhausted."""
 
 # Infer endpoint from model name (longest match wins)
 _MODEL_ENDPOINTS: list[tuple[str, str]] = [
@@ -89,22 +93,20 @@ async def _post_with_retry(
             logger.warning("LLM request error (attempt %d): %s — retrying", attempt, exc)
             continue
 
-        if resp.status_code in (429, 500, 502, 503, 504) and attempt < _MAX_RETRIES:
+        if resp.status_code == 429:
+            if attempt < _MAX_RETRIES:
+                attempt += 1
+                retry_after = min(int(resp.headers.get("retry-after", _RETRY_DELAYS[0])), 15)
+                logger.warning("LLM 429 rate-limited (attempt %d) — retrying in %ds", attempt, retry_after)
+                await asyncio.sleep(retry_after)
+                continue
+            # Retries exhausted on 429 — raise immediately so executor can skip
+            raise RateLimitError(f"Rate limited after {attempt + 1} attempts (HTTP 429)")
+
+        if resp.status_code in (500, 502, 503, 504) and attempt < _MAX_RETRIES:
             attempt += 1
-            # Cap retry-after at 30s — providers sometimes return 60s+ which
-            # causes suites to hang for minutes when rate-limited.
-            retry_after = min(
-                int(resp.headers.get("retry-after", _RETRY_DELAYS[min(attempt - 1, len(_RETRY_DELAYS) - 1)])),
-                30,
-            )
-            if resp.status_code == 429:
-                # Print structured line so sandbox stdout surfaces it as an SSE hint
-                print(f"FAIRSIGHT_RATE_LIMITED: model={model} retry_in={retry_after}s attempt={attempt}", flush=True)
-            logger.warning(
-                "LLM HTTP %d (attempt %d) — retrying in %ds",
-                resp.status_code, attempt, retry_after,
-            )
-            await asyncio.sleep(retry_after)
+            logger.warning("LLM HTTP %d (attempt %d) — retrying in 5s", resp.status_code, attempt)
+            await asyncio.sleep(5)
             continue
 
         resp.raise_for_status()
