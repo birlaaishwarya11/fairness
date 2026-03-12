@@ -245,23 +245,34 @@ def run_test(args: argparse.Namespace) -> None:
                         else:
                             print(f"[{elapsed:6.1f}s] SANDBOX : {status}")
 
-                    elif phase == "recon" and status == "complete":
-                        data = event.get("data", {})
-                        print(f"[{elapsed:6.1f}s] RECON   : {data.get('recon_summary', '')[:120]}")
+                    elif phase == "recon":
+                        if status == "running":
+                            print(f"\r[{elapsed:6.1f}s] RECON   : {event.get('message', '…')}", end="", flush=True)
+                        elif status == "complete":
+                            print()  # end the \r line
+                            data = event.get("data", {})
+                            print(f"[{elapsed:6.1f}s] RECON   : {data.get('recon_summary', '')[:120]}")
 
-                    elif phase == "planning" and status == "complete":
-                        data = event.get("data", {})
-                        suites = data.get("test_suites", [])
-                        print(f"[{elapsed:6.1f}s] PLAN    : {len(suites)} suites planned")
-                        for s in suites:
-                            print(f"             - {s.get('suite_name')} ({s.get('probe_category')})")
+                    elif phase == "planning":
+                        if status == "running":
+                            print(f"\r[{elapsed:6.1f}s] PLAN    : {event.get('message', '…')}", end="", flush=True)
+                        elif status == "complete":
+                            print()  # end the \r line
+                            data = event.get("data", {})
+                            suites = data.get("test_suites", [])
+                            print(f"[{elapsed:6.1f}s] PLAN    : {len(suites)} suites planned")
+                            for s in suites:
+                                print(f"             - {s.get('suite_name')} ({s.get('probe_category')})")
 
-                    elif phase == "execution" and status == "complete":
-                        data = event.get("data", {})
-                        print(
-                            f"[{elapsed:6.1f}s] SUITE   : {data.get('suite_name')} — "
-                            f"risk={data.get('risk_level')} avg={data.get('average_score')}"
-                        )
+                    elif phase == "execution":
+                        if status == "running":
+                            print(f"\r[{elapsed:6.1f}s] EXEC    : {event.get('message', '…')}", end="", flush=True)
+                        elif status == "complete":
+                            data = event.get("data", {})
+                            print(
+                                f"\n[{elapsed:6.1f}s] SUITE   : {data.get('suite_name')} — "
+                                f"risk={data.get('risk_level')} avg={data.get('average_score')}"
+                            )
 
                     elif phase == "report" and status == "complete":
                         report = event.get("data", {})

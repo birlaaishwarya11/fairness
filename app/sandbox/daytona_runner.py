@@ -69,6 +69,26 @@ async def _aexec(sandbox, cmd: str) -> str:
     return getattr(result, "output", "") or ""
 
 
+async def _with_heartbeat(coro, phase: str, interval: float = 10.0):
+    """
+    Run an awaitable while yielding SSE heartbeat ticks every `interval`
+    seconds so the client knows the phase is still running.
+    Yields heartbeat dicts; the final value is the coroutine result.
+    """
+    task = asyncio.ensure_future(coro)
+    elapsed = 0.0
+    while not task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+        except asyncio.TimeoutError:
+            elapsed += interval
+            yield {"phase": phase, "status": "running", "message": f"Still working… ({int(elapsed)}s elapsed)"}
+        except Exception:
+            break
+    # Propagate any exception from the task
+    yield task.result()  # raises if task raised
+
+
 async def _acode_run(sandbox, code: str) -> str:
     """Run Python code via shell exec — write to a temp file, then execute.
 
@@ -331,13 +351,21 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
 
         # ── Phase 1: Recon ────────────────────────────────────────────────────
         yield _sse({"phase": "recon", "status": "started"})
-        raw = await _acode_run(sandbox, _recon_code(req, env))
+        async for tick in _with_heartbeat(_acode_run(sandbox, _recon_code(req, env)), "recon"):
+            if isinstance(tick, str):
+                raw = tick
+            else:
+                yield _sse(tick)
         recon_data = _parse_result(raw)
         yield _sse({"phase": "recon", "status": "complete", "data": recon_data})
 
         # ── Phase 2: Planning ─────────────────────────────────────────────────
         yield _sse({"phase": "planning", "status": "started"})
-        raw = await _acode_run(sandbox, _plan_code(req, recon_data, env))
+        async for tick in _with_heartbeat(_acode_run(sandbox, _plan_code(req, recon_data, env)), "planning"):
+            if isinstance(tick, str):
+                raw = tick
+            else:
+                yield _sse(tick)
         plan_data = _parse_result(raw)
         yield _sse({"phase": "planning", "status": "complete", "data": plan_data})
 
@@ -356,10 +384,16 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
         }
 
         pending = set(suite_futures.keys())
+        exec_elapsed = 0
         while pending:
             done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED
+                pending, return_when=asyncio.FIRST_COMPLETED, timeout=10.0
             )
+            if not done:
+                # Timeout — no suite finished yet, emit heartbeat
+                exec_elapsed += 10
+                yield _sse({"phase": "execution", "status": "running",
+                             "message": f"Suites running… ({exec_elapsed}s elapsed, {len(pending)} remaining)"})
             for fut in done:
                 suite = suite_futures[fut]
                 try:
