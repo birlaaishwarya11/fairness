@@ -100,9 +100,9 @@ async def _bootstrap(sandbox) -> None:
     Install deps + upload all project Python source files.
     This is done once per sandbox, before any phase runs.
 
-    All source files are bundled into a single Python installer script and
-    executed in one exec call — avoids Daytona concurrency limits that cause
-    silent drops when firing 18+ parallel exec calls.
+    Files are written SEQUENTIALLY — one exec call per file, keeping each
+    command small (<15 KB). Parallel or large-batch approaches hit Daytona
+    exec command-length/concurrency limits and silently drop writes.
     """
     # Collect all .py files (skip __pycache__ and .venv)
     py_files = [
@@ -110,39 +110,33 @@ async def _bootstrap(sandbox) -> None:
         if "__pycache__" not in p.parts and ".venv" not in p.parts
     ]
 
-    # Build a single installer script with all files embedded as a dict.
-    # Running one script >> 18 parallel exec calls (no concurrency drop risk).
-    files_dict: dict[str, str] = {
-        f"{_WORKSPACE}/{p.relative_to(_PROJECT_ROOT)}": base64.b64encode(p.read_bytes()).decode()
-        for p in py_files
-    }
-
-    installer = (
-        "import base64, os\n"
-        f"files = {repr(files_dict)}\n"
-        "for dest, b64 in files.items():\n"
-        "    os.makedirs(dest.rsplit('/', 1)[0], exist_ok=True)\n"
-        "    open(dest, 'wb').write(base64.b64decode(b64))\n"
-        f"print('wrote', len(files), 'files')\n"
-    )
-    encoded_installer = base64.b64encode(installer.encode()).decode()
-
-    # Step 1: write + run the installer (2 exec calls total for all files)
     await _aexec(sandbox, f"mkdir -p {_WORKSPACE}")
-    await _aexec(
-        sandbox,
-        f"python3 -c \"import base64; "
-        f"open('/tmp/_fs_install.py','w').write(base64.b64decode('{encoded_installer}').decode())\""
-    )
-    install_out = await _aexec(sandbox, f"python3 /tmp/_fs_install.py 2>&1")
-    logger.info("File installer output: %s", install_out.strip() or "(none)")
 
-    # Step 2: install Python deps
+    # Write files sequentially; mkdir only once per unique directory.
+    dirs_created: set[str] = set()
+    for p in py_files:
+        dest = f"{_WORKSPACE}/{p.relative_to(_PROJECT_ROOT)}"
+        dir_path = dest.rsplit("/", 1)[0]
+        if dir_path not in dirs_created:
+            await _aexec(sandbox, f"mkdir -p {dir_path}")
+            dirs_created.add(dir_path)
+        b64 = base64.b64encode(p.read_bytes()).decode()
+        out = await _aexec(
+            sandbox,
+            f"python3 -c \"import base64; "
+            f"open('{dest}','wb').write(base64.b64decode('{b64}'))\""
+        )
+        if out.strip():
+            logger.warning("Write %s stderr: %s", dest, out.strip())
+
+    logger.info("Wrote %d source files to sandbox", len(py_files))
+
+    # Install Python deps
     deps_str = " ".join(_SANDBOX_DEPS)
     pip_out = await _aexec(
         sandbox, f"python3 -m pip install -q {deps_str} 2>&1"
     )
-    logger.info("pip install output: %s", pip_out.strip()[-300:] if pip_out.strip() else "(none)")
+    logger.info("pip install: %s", pip_out.strip()[-300:] if pip_out.strip() else "ok")
 
     check = await _aexec(sandbox, f"ls {_WORKSPACE}/app/ 2>&1 | head -10")
     logger.info("Sandbox bootstrapped: %d files | app/ contents: %s", len(py_files), check.strip())
