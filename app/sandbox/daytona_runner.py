@@ -386,8 +386,6 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
     Worker sandboxes      → one per suite (pre-spun during recon so bootstrap
                             cost is hidden inside the recon wait time)
     """
-    from app.models.schemas import _DEPTH_SUITE_COUNT as _DSC  # noqa: avoid circular at module level
-
     daytona = _make_client()
     orch_sandbox = None
     worker_pool: list[tuple] = []  # list of (daytona_client, sandbox)
