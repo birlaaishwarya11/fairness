@@ -1,0 +1,25 @@
+{
+  "name": "fairsight-backend",
+  "image": "python:3.11",
+  "postCreateCommand": "pip install -r requirements.txt",
+  "forwardPorts": [8000],
+  "remoteEnv": {
+    "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+    "TAVILY_API_KEY": "${localEnv:TAVILY_API_KEY}",
+    "DAYTONA_API_KEY": "${localEnv:DAYTONA_API_KEY}",
+    "DAYTONA_SERVER_URL": "${localEnv:DAYTONA_SERVER_URL}"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "editor.formatOnSave": true
+      }
+    }
+  }
+}
