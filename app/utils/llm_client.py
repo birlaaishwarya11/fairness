@@ -55,6 +55,18 @@ def _is_anthropic_endpoint(endpoint: str) -> bool:
     return "anthropic.com" in endpoint
 
 
+def _is_azure_endpoint(endpoint: str) -> bool:
+    return "azure.com" in endpoint or "cognitive.microsoft.com" in endpoint
+
+
+def _ensure_api_version(endpoint: str, version: str = "2024-02-01") -> str:
+    """Append ?api-version if not already present."""
+    if "api-version" not in endpoint:
+        sep = "&" if "?" in endpoint else "?"
+        return f"{endpoint}{sep}api-version={version}"
+    return endpoint
+
+
 async def _post_with_retry(
     client: httpx.AsyncClient,
     endpoint: str,
@@ -118,6 +130,43 @@ async def _call_anthropic(
     return ""
 
 
+async def _call_azure(
+    messages: list[dict],
+    model: str,
+    api_key: str,
+    system: str,
+    max_tokens: int,
+    endpoint: str,
+) -> str:
+    """Call Azure OpenAI REST API.
+
+    Azure differs from standard OpenAI in two ways:
+      - Auth header is `api-key` not `Authorization: Bearer`
+      - Endpoint must include `?api-version=`
+    The deployment name is already in the endpoint path, so `model` in
+    the request body is optional but harmless to include.
+    """
+    url = _ensure_api_version(endpoint)
+    payload_messages: list[dict] = []
+    if system:
+        payload_messages.append({"role": "system", "content": system})
+    payload_messages.extend(messages)
+
+    headers = {
+        "api-key": api_key,
+        "Content-Type": "application/json",
+    }
+    payload = {"model": model, "messages": payload_messages, "max_tokens": max_tokens}
+
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await _post_with_retry(client, url, payload, headers)
+        data = resp.json()
+        choices = data.get("choices", [])
+        if choices:
+            return choices[0].get("message", {}).get("content", "") or ""
+    return ""
+
+
 async def _call_openai_compat(
     messages: list[dict],
     model: str,
@@ -157,11 +206,13 @@ async def call_llm(
     endpoint: Optional[str] = None,
 ) -> str:
     """
-    Unified async LLM call — Anthropic and OpenAI-compatible.
+    Unified async LLM call — Anthropic, Azure OpenAI, and OpenAI-compatible.
     Pure httpx: no provider SDK needed in the sandbox.
     Retries automatically on 429 / 5xx with exponential backoff.
     """
     resolved = endpoint or default_endpoint(model)
     if _is_anthropic_endpoint(resolved):
         return await _call_anthropic(messages, model, api_key, system, max_tokens, resolved)
+    if _is_azure_endpoint(resolved):
+        return await _call_azure(messages, model, api_key, system, max_tokens, resolved)
     return await _call_openai_compat(messages, model, api_key, system, max_tokens, resolved)
