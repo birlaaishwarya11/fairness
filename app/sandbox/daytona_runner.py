@@ -43,7 +43,7 @@ _SENTINEL = "FAIRSIGHT_RESULT:"
 # anthropic package is NOT required: Anthropic API is called directly via httpx.
 _SANDBOX_DEPS = [
     "tavily-python==0.3.3",
-    "httpx>=0.28.0,<0.29.0",
+    "httpx==0.28.1",
     "pydantic>=2.9.0",
     "python-dotenv==1.0.1",
 ]
