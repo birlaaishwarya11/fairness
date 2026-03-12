@@ -128,10 +128,11 @@ async def _bootstrap(sandbox) -> None:
     ]
     await asyncio.gather(*write_tasks)
 
-    # Step 3: install deps AFTER files land — use timeout=0 to wait as long as needed
+    # Step 3: install deps AFTER files land — install into _WORKSPACE so they're
+    # found via PYTHONPATH without needing site-packages to be on sys.path.
     deps_str = " ".join(_SANDBOX_DEPS)
     pip_result = await sandbox.process.exec(
-        f"python3 -m pip install {deps_str} 2>&1",
+        f"python3 -m pip install --target={_WORKSPACE} {deps_str} 2>&1",
         timeout=0,
     )
     pip_out = (getattr(pip_result, "output", "") or getattr(pip_result, "result", "") or "").strip()
