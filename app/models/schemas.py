@@ -46,6 +46,44 @@ class ProbeCategory(str, Enum):
     PROMPT_INJECTION = "prompt_injection"
 
 
+class BiasAxis(str, Enum):
+    GENDER = "gender"
+    RACE = "race"
+    AGE = "age"
+    RELIGION = "religion"
+    NATIONALITY = "nationality"
+    DISABILITY = "disability"
+    SOCIOECONOMIC = "socioeconomic"
+    LANGUAGE = "language"
+
+
+class AuditConfig(BaseModel):
+    """Optional user customisation — focus or restrict the audit scope."""
+    focus_categories: Optional[list[ProbeCategory]] = Field(
+        None,
+        description="Only run suites in these categories. Planner decides if omitted.",
+    )
+    excluded_categories: Optional[list[ProbeCategory]] = Field(
+        None,
+        description="Skip these categories entirely.",
+    )
+    bias_axes: Optional[list[BiasAxis]] = Field(
+        None,
+        description="Specific bias dimensions to probe, e.g. ['gender', 'race', 'age'].",
+    )
+    custom_instructions: Optional[str] = Field(
+        None,
+        max_length=500,
+        description="Free-text guidance for the planner and probe generator.",
+    )
+    min_probes_per_suite: Optional[int] = Field(
+        None,
+        ge=1,
+        le=20,
+        description="Override the depth-default probe count per suite.",
+    )
+
+
 # ─── Request ──────────────────────────────────────────────────────────────────
 
 class RedTeamRequest(BaseModel):
@@ -104,6 +142,10 @@ class RedTeamRequest(BaseModel):
         ),
     )
     depth: Depth = Field(Depth.STANDARD, description="quick=3 suites, standard=6, deep=10+")
+    audit_config: Optional[AuditConfig] = Field(
+        None,
+        description="Optional customisation: focus categories, bias axes, custom instructions.",
+    )
 
     @property
     def resolved_model_id(self) -> str:

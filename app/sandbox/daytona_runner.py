@@ -1,21 +1,21 @@
 """
-daytona_runner.py
+daytona_runner.py — Orchestrator + Worker architecture
 
-Executes the full FairSight pipeline inside an ephemeral Daytona sandbox.
+Orchestrator (this process):
+  Coordinates the 4-phase pipeline, streams SSE events to the client.
 
-Each POST /red-team request:
-  1. Creates a fresh Python sandbox via the Daytona API
-  2. Uploads all project .py source files to /workspace/
-  3. Installs Python dependencies
-  4. Runs each pipeline phase as an isolated code_run() call
-  5. Yields phase events as SSE-formatted strings (real-time streaming)
-  6. Destroys the sandbox on completion or error
+Workers (Daytona sandboxes):
+  - Orchestrator sandbox  : recon → planning → report  (sequential, 1 sandbox)
+  - Suite worker sandboxes: one per suite, bootstrapped in parallel WHILE
+    recon + planning run so the bootstrap cost is hidden from the user.
 
-Phase streaming works by executing one code_run per phase/suite — each call
-blocks until that unit of work completes, then we yield the SSE event and
-move to the next. Suite execution is parallelised across threads using
-asyncio.get_event_loop().run_in_executor so multiple suites run concurrently
-while still yielding individual completion events as they arrive.
+Pipeline flow:
+  1. Provision orchestrator sandbox + pre-spin N worker sandboxes in parallel
+  2. Orchestrator runs recon + planning  (worker sandboxes bootstrap concurrently)
+  3. Workers are ready by the time planning finishes → dispatch suites immediately
+  4. Collect suite results as they arrive (streaming)
+  5. Orchestrator runs report
+  6. All sandboxes torn down in finally block
 """
 
 from __future__ import annotations
@@ -243,13 +243,16 @@ _result = asyncio.run(_run())
 
 
 def _plan_code(req: RedTeamRequest, recon_data: dict, env: str) -> str:
+    audit_cfg_repr = repr(req.audit_config.model_dump() if req.audit_config else None)
     body = f"""
 from app.agents.planner_agent import run_planning
-from app.models.schemas import ReconReport, Depth
+from app.models.schemas import ReconReport, Depth, AuditConfig
 
 async def _run():
     recon = ReconReport.model_validate({repr(recon_data)})
-    plan = await run_planning(recon, Depth({repr(req.depth.value)}))
+    _cfg_raw = {audit_cfg_repr}
+    audit_config = AuditConfig.model_validate(_cfg_raw) if _cfg_raw else None
+    plan = await run_planning(recon, Depth({repr(req.depth.value)}), audit_config)
     return plan.model_dump_json()
 
 _result = asyncio.run(_run())
@@ -263,19 +266,22 @@ def _suite_code(
     recon_data: dict,
     env: str,
 ) -> str:
+    audit_cfg_repr = repr(req.audit_config.model_dump() if req.audit_config else None)
     body = f"""
 from app.agents.attacker_agent import generate_probes
 from app.agents.executor_agent import execute_probes_batch
 from app.agents.judge_agent import judge_suite
-from app.models.schemas import TestSuite, ReconReport
+from app.models.schemas import TestSuite, ReconReport, AuditConfig
 
 _SUITE_TIMEOUT = 240  # 4 minutes max per suite — prevents hangs on rate limits
 
 async def _run():
     suite = TestSuite.model_validate({repr(suite_data)})
     recon = ReconReport.model_validate({repr(recon_data)})
+    _cfg_raw = {audit_cfg_repr}
+    audit_config = AuditConfig.model_validate(_cfg_raw) if _cfg_raw else None
 
-    probes = await generate_probes(suite, recon)
+    probes = await generate_probes(suite, recon, audit_config)
     pairs = await execute_probes_batch(
         probes,
         target={repr(req.target)},
@@ -328,34 +334,101 @@ def _sse(event: dict) -> str:
     return f"data: {json.dumps(event)}\n\n"
 
 
+# ─── Worker sandbox helpers ───────────────────────────────────────────────────
+
+async def _provision_worker(req: RedTeamRequest) -> tuple:
+    """
+    Create and fully bootstrap a worker sandbox.
+    Returns (daytona_client, sandbox) — caller must tear both down.
+    Bootstrap runs silently; logs show progress.
+    """
+    daytona = _make_client()
+    sandbox = await daytona.create(CreateSandboxFromSnapshotParams(language="python"))
+    logger.info("Worker sandbox created: id=%s", getattr(sandbox, "id", "?"))
+    async for _ in _bootstrap(sandbox):
+        pass  # bootstrap progress consumed silently for workers
+    logger.info("Worker sandbox ready: id=%s", getattr(sandbox, "id", "?"))
+    return daytona, sandbox
+
+
+async def _teardown_worker(daytona, sandbox) -> None:
+    try:
+        await daytona.delete(sandbox)
+        logger.info("Worker sandbox removed: id=%s", getattr(sandbox, "id", "?"))
+    except Exception as exc:
+        logger.warning("Could not remove worker sandbox: %s", exc)
+    try:
+        await daytona.close()
+    except Exception:
+        pass
+
+
+async def _run_suite_on_worker(
+    req: RedTeamRequest,
+    suite_data: dict,
+    recon_data: dict,
+    daytona,
+    sandbox,
+) -> dict:
+    """Run one suite on a pre-bootstrapped worker sandbox and return result dict."""
+    env = _env_setup(req)
+    raw = await _acode_run(sandbox, _suite_code(req, suite_data, recon_data, env))
+    return _parse_result(raw)
+
+
 # ─── Main pipeline runner ─────────────────────────────────────────────────────
 
 async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
     """
-    Run the full red-team pipeline inside a Daytona sandbox.
-    Yields SSE-formatted strings as each phase completes.
-    The sandbox is always destroyed on exit (success or error).
+    Orchestrator: coordinates the 4-phase pipeline, streams SSE events.
+
+    Orchestrator sandbox  → recon + planning + report
+    Worker sandboxes      → one per suite (pre-spun during recon so bootstrap
+                            cost is hidden inside the recon wait time)
     """
+    from app.models.schemas import _DEPTH_SUITE_COUNT as _DSC  # noqa: avoid circular at module level
+
     daytona = _make_client()
-    sandbox = None
+    orch_sandbox = None
+    worker_pool: list[tuple] = []  # list of (daytona_client, sandbox)
 
     try:
-        # ── Provision sandbox ─────────────────────────────────────────────────
+        # ── Provision orchestrator sandbox ────────────────────────────────────
         yield _sse({"phase": "sandbox", "status": "provisioning"})
+        orch_sandbox = await daytona.create(CreateSandboxFromSnapshotParams(language="python"))
+        logger.info("Orchestrator sandbox created: id=%s", getattr(orch_sandbox, "id", "?"))
 
-        sandbox = await daytona.create(CreateSandboxFromSnapshotParams(language="python"))
-        logger.info("Sandbox created: id=%s", getattr(sandbox, "id", "?"))
+        # Bootstrap orchestrator + pre-spin worker sandboxes IN PARALLEL.
+        # Worker bootstrap (~30-60s) overlaps with recon so users don't wait twice.
+        _depth_counts = {"quick": 3, "standard": 6, "deep": 10}
+        n_workers = _depth_counts.get(req.depth.value, 3)
+        yield _sse({"phase": "sandbox", "status": "bootstrapping",
+                    "message": f"Bootstrapping orchestrator + {n_workers} worker sandboxes…"})
 
-        yield _sse({"phase": "sandbox", "status": "bootstrapping"})
-        async for progress in _bootstrap(sandbox):
-            yield _sse(progress)
-        yield _sse({"phase": "sandbox", "status": "ready"})
+        async def _bootstrap_orch():
+            results = []
+            async for p in _bootstrap(orch_sandbox):
+                results.append(p)
+            return results
+
+        orch_bootstrap_task = asyncio.ensure_future(_bootstrap_orch())
+        worker_tasks = [asyncio.ensure_future(_provision_worker(req)) for _ in range(n_workers)]
+
+        # Stream orchestrator bootstrap progress while workers spin up silently
+        bootstrap_results = await orch_bootstrap_task
+        for p in bootstrap_results:
+            yield _sse(p)
+
+        # Collect worker sandboxes (they may already be done)
+        worker_pool = list(await asyncio.gather(*worker_tasks))
+        yield _sse({"phase": "sandbox", "status": "ready",
+                    "message": f"Orchestrator + {n_workers} workers ready"})
 
         env = _env_setup(req)
 
         # ── Phase 1: Recon ────────────────────────────────────────────────────
         yield _sse({"phase": "recon", "status": "started"})
-        async for tick in _with_heartbeat(_acode_run(sandbox, _recon_code(req, env)), "recon"):
+        async for tick in _with_heartbeat(_acode_run(orch_sandbox, _recon_code(req, env)), "recon"):
             if isinstance(tick, str):
                 raw = tick
             else:
@@ -365,7 +438,7 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
 
         # ── Phase 2: Planning ─────────────────────────────────────────────────
         yield _sse({"phase": "planning", "status": "started"})
-        async for tick in _with_heartbeat(_acode_run(sandbox, _plan_code(req, recon_data, env)), "planning"):
+        async for tick in _with_heartbeat(_acode_run(orch_sandbox, _plan_code(req, recon_data, env)), "planning"):
             if isinstance(tick, str):
                 raw = tick
             else:
@@ -373,54 +446,61 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
         plan_data = _parse_result(raw)
         yield _sse({"phase": "planning", "status": "complete", "data": plan_data})
 
-        # ── Phase 3: Execution (suites run in parallel threads) ───────────────
+        # ── Phase 3: Execution — dispatch suites to pre-warmed workers ────────
         suites = plan_data.get("test_suites", [])
         yield _sse({"phase": "execution", "status": "started", "total_suites": len(suites)})
 
         suite_results: list[dict] = []
 
-        # Build one Future per suite so we can stream completions as they arrive
-        suite_futures: dict[asyncio.Future, dict] = {
-            asyncio.ensure_future(
-                _acode_run(sandbox, _suite_code(req, suite, recon_data, env))
-            ): suite
-            for suite in suites
-        }
+        # Pair each suite with a worker (extras released, shortfall uses orch sandbox)
+        suite_worker_pairs = list(zip(suites, worker_pool))
+        overflow_suites = suites[len(worker_pool):]  # run on orch sandbox if more suites than workers
+
+        suite_futures: dict[asyncio.Future, dict] = {}
+        for suite, (w_daytona, w_sandbox) in suite_worker_pairs:
+            fut = asyncio.ensure_future(
+                _run_suite_on_worker(req, suite, recon_data, w_daytona, w_sandbox)
+            )
+            suite_futures[fut] = suite
+
+        for suite in overflow_suites:
+            fut = asyncio.ensure_future(
+                _run_suite_on_worker(req, suite, recon_data, daytona, orch_sandbox)
+            )
+            suite_futures[fut] = suite
 
         pending = set(suite_futures.keys())
         exec_elapsed = 0
         rate_limit_detected = False
+
         while pending:
             done, pending = await asyncio.wait(
                 pending, return_when=asyncio.FIRST_COMPLETED, timeout=10.0
             )
             if not done:
                 exec_elapsed += 10
-                # After 60s with no completion, likely rate-limited
                 if exec_elapsed >= 60 and not rate_limit_detected:
                     rate_limit_detected = True
                     yield _sse({
-                        "phase": "execution",
-                        "status": "rate_limited",
+                        "phase": "execution", "status": "rate_limited",
                         "message": (
-                            f"Rate limiting detected — the target model is throttling requests. "
-                            f"Retrying automatically… ({exec_elapsed}s elapsed, {len(pending)} suites remaining)"
+                            f"Rate limiting detected on target model — retrying automatically… "
+                            f"({exec_elapsed}s elapsed, {len(pending)} suites remaining)"
                         ),
                     })
                 elif rate_limit_detected:
                     yield _sse({
-                        "phase": "execution",
-                        "status": "rate_limited",
+                        "phase": "execution", "status": "rate_limited",
                         "message": f"Still retrying after rate limit… ({exec_elapsed}s elapsed, {len(pending)} suites remaining)",
                     })
                 else:
                     yield _sse({"phase": "execution", "status": "running",
                                  "message": f"Suites running… ({exec_elapsed}s elapsed, {len(pending)} remaining)"})
+
             for fut in done:
                 suite = suite_futures[fut]
                 try:
-                    raw = fut.result()
-                    result = _parse_result(raw)
+                    result = fut.result()
                     suite_results.append(result)
                     yield _sse({
                         "phase": "execution",
@@ -438,34 +518,36 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
                         "status": "error",
                         "error": (
                             "Suite timed out — likely caused by API rate limiting. "
-                            "Consider using a higher-tier API key or retrying."
+                            "Consider using a higher-quota API key."
                         ) if is_timeout else err_str,
                         "rate_limited": is_timeout,
                     })
 
-        # ── Phase 4: Report ───────────────────────────────────────────────────
+        # ── Phase 4: Report (on orchestrator sandbox) ─────────────────────────
         yield _sse({"phase": "report", "status": "started"})
         raw = await _acode_run(
-            sandbox,
+            orch_sandbox,
             _report_code(req, recon_data, plan_data, suite_results, env),
         )
         report_data = _parse_result(raw)
         yield _sse({"phase": "report", "status": "complete", "data": report_data})
 
     except Exception as exc:
-        logger.error("Sandbox pipeline fatal error: %s", exc, exc_info=True)
+        logger.error("Pipeline fatal error: %s", exc, exc_info=True)
         yield _sse({"phase": "error", "status": "error", "error": str(exc)})
 
     finally:
-        if sandbox is not None:
+        # Tear down orchestrator sandbox
+        if orch_sandbox is not None:
             try:
-                await daytona.delete(sandbox)
-                logger.info("Sandbox removed: id=%s", getattr(sandbox, "id", "?"))
+                await daytona.delete(orch_sandbox)
+                logger.info("Orchestrator sandbox removed: id=%s", getattr(orch_sandbox, "id", "?"))
             except Exception as exc:
-                logger.warning("Could not remove sandbox: %s", exc)
-        # Close the Daytona client's internal aiohttp session to avoid
-        # "Unclosed client session" warnings at process exit.
+                logger.warning("Could not remove orchestrator sandbox: %s", exc)
         try:
             await daytona.close()
         except Exception:
             pass
+        # Tear down all worker sandboxes
+        for w_daytona, w_sandbox in worker_pool:
+            await _teardown_worker(w_daytona, w_sandbox)
