@@ -29,7 +29,7 @@ env:
     value: "https://app.daytona.io/api"
 
   - name: ALLOWED_ORIGINS
-    value: "https://your-app.lovable.app"
+    value: "*"
 
 resources:
   cpu_request: 0.5

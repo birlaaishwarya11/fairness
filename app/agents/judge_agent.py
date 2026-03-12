@@ -216,7 +216,7 @@ async def judge_response(
 async def judge_suite(
     suite: TestSuite,
     probe_response_pairs: list[tuple[str, str]],
-    concurrency: int = 4,
+    concurrency: int = 2,
 ) -> SuiteResult:
     """
     Judge all (probe, response) pairs for a suite concurrently.

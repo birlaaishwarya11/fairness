@@ -99,36 +99,37 @@ def run_test(args: argparse.Namespace) -> None:
                         continue
 
                     event_count += 1
-                    event_type = event.get("type", "unknown")
+                    phase = event.get("phase", "")
+                    status = event.get("status", "")
                     elapsed = time.time() - start
 
-                    if event_type == "status":
-                        print(f"[{elapsed:6.1f}s] STATUS  : {event.get('message', '')}")
+                    if phase == "sandbox":
+                        print(f"[{elapsed:6.1f}s] SANDBOX : {status}")
 
-                    elif event_type == "recon/complete":
+                    elif phase == "recon" and status == "complete":
                         data = event.get("data", {})
                         print(f"[{elapsed:6.1f}s] RECON   : {data.get('recon_summary', '')[:120]}")
 
-                    elif event_type == "plan/complete":
+                    elif phase == "planning" and status == "complete":
                         data = event.get("data", {})
-                        suites = data.get("suites", [])
+                        suites = data.get("test_suites", [])
                         print(f"[{elapsed:6.1f}s] PLAN    : {len(suites)} suites planned")
                         for s in suites:
                             print(f"             - {s.get('suite_name')} ({s.get('probe_category')})")
 
-                    elif event_type == "suite/complete":
+                    elif phase == "execution" and status == "complete":
                         data = event.get("data", {})
                         print(
                             f"[{elapsed:6.1f}s] SUITE   : {data.get('suite_name')} — "
                             f"risk={data.get('risk_level')} avg={data.get('average_score')}"
                         )
 
-                    elif event_type == "report/complete":
+                    elif phase == "report" and status == "complete":
                         report = event.get("data", {})
                         print(f"\n[{elapsed:6.1f}s] REPORT READY")
 
-                    elif event_type == "error":
-                        print(f"[{elapsed:6.1f}s] ERROR   : {event.get('message', '')}")
+                    elif status == "error":
+                        print(f"[{elapsed:6.1f}s] ERROR   : {event.get('error', event.get('message', ''))}")
 
     elapsed_total = time.time() - start
     print(f"\n{'='*60}")

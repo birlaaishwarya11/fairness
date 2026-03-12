@@ -21,25 +21,27 @@ while still yielding individual completion events as they arrive.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import AsyncIterator
 
-from daytona_sdk import Daytona, DaytonaConfig, CreateSandboxParams
+from daytona_sdk import AsyncDaytona, DaytonaConfig, CreateSandboxFromSnapshotParams
 
 from app.models.schemas import FinalReport, RedTeamRequest
 
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).parent.parent.parent  # .../fairsight-backend/
-_WORKSPACE = "/workspace"
+_WORKSPACE = "/tmp/fairsight"
 _SENTINEL = "FAIRSIGHT_RESULT:"
 
-# Pinned versions mirror requirements.txt (minus the server-side packages)
+# Only httpx is needed — llm_client.py calls all providers via REST (no SDK).
+# anthropic package is NOT required: Anthropic API is called directly via httpx.
 _SANDBOX_DEPS = [
-    "anthropic==0.28.0",
     "tavily-python==0.3.3",
     "httpx==0.27.0",
     "pydantic>=2.9.0",
@@ -49,8 +51,8 @@ _SANDBOX_DEPS = [
 
 # ─── Daytona client ───────────────────────────────────────────────────────────
 
-def _make_client() -> Daytona:
-    return Daytona(
+def _make_client() -> AsyncDaytona:
+    return AsyncDaytona(
         DaytonaConfig(
             api_key=os.environ["DAYTONA_API_KEY"],
             server_url=os.environ.get(
@@ -60,68 +62,82 @@ def _make_client() -> Daytona:
     )
 
 
-# ─── Async wrappers for the sync Daytona SDK ─────────────────────────────────
+# ─── Async helpers ────────────────────────────────────────────────────────────
 
 async def _aexec(sandbox, cmd: str) -> str:
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None, lambda: sandbox.process.exec(cmd)
-    )
+    result = await sandbox.process.exec(cmd)
     return getattr(result, "output", "") or ""
 
 
 async def _acode_run(sandbox, code: str) -> str:
-    """Run Python code in the sandbox; return raw stdout."""
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None, lambda: sandbox.process.code_run(code)
-    )
-    return getattr(result, "result", "") or ""
+    """Run Python code via shell exec — write to a temp file, then execute.
 
-
-async def _aupload(sandbox, dest_path: str, content: bytes) -> None:
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
-        None, lambda: sandbox.fs.upload_file(dest_path, content)
+    Avoids all shell-quoting / -c escaping issues. Uses `env PYTHONPATH=`
+    instead of inline VAR=val so it works in any POSIX shell.
+    stderr is merged into stdout (2>&1) so phase errors appear in the output
+    and are caught by _parse_result.
+    """
+    # Use a unique temp file per invocation so parallel suite runs don't
+    # overwrite each other's code before execution.
+    tmp = f"/tmp/_fs_{uuid.uuid4().hex}.py"
+    encoded = base64.b64encode(code.encode()).decode()
+    # Step 1: write the code to a unique temp file
+    write_cmd = (
+        f"python3 -c \"import base64; "
+        f"open('{tmp}','w').write(base64.b64decode('{encoded}').decode())\""
     )
+    await sandbox.process.exec(write_cmd)
+    # Step 2: run the temp file with PYTHONPATH set
+    run_cmd = f"env PYTHONPATH={_WORKSPACE} python3 {tmp} 2>&1"
+    result = await sandbox.process.exec(run_cmd)
+    return getattr(result, "output", "") or getattr(result, "result", "") or ""
 
 
 # ─── Sandbox bootstrap ────────────────────────────────────────────────────────
 
 async def _bootstrap(sandbox) -> None:
     """
-    Install deps + upload all project Python source files in parallel.
+    Install deps + upload all project Python source files.
     This is done once per sandbox, before any phase runs.
     """
-    # Collect all .py files (skip __pycache__)
+    # Collect all .py files (skip __pycache__ and .venv)
     py_files = [
         p for p in _PROJECT_ROOT.rglob("*.py")
-        if "__pycache__" not in p.parts
+        if "__pycache__" not in p.parts and ".venv" not in p.parts
     ]
 
-    # Create directory tree first
-    dirs = {
-        str(Path(p.relative_to(_PROJECT_ROOT)).parent)
-        for p in py_files
-    }
-    mkdir_tasks = [
-        _aexec(sandbox, f"mkdir -p {_WORKSPACE}/{d}")
-        for d in sorted(dirs)
-        if d != "."
-    ]
-    await asyncio.gather(*mkdir_tasks)
-
-    # Upload files + install deps in parallel
-    upload_tasks = [
-        _aupload(sandbox, f"{_WORKSPACE}/{p.relative_to(_PROJECT_ROOT)}", p.read_bytes())
-        for p in py_files
-    ]
-    install_task = _aexec(
-        sandbox,
-        f"pip install -q {' '.join(_SANDBOX_DEPS)}"
+    # Install deps and create workspace dir in parallel
+    await asyncio.gather(
+        _aexec(sandbox, f"mkdir -p {_WORKSPACE}"),
+        _aexec(sandbox, f"pip install -q {' '.join(_SANDBOX_DEPS)}"),
     )
-    await asyncio.gather(*upload_tasks, install_task)
-    logger.info("Sandbox bootstrapped: %d files, deps installed", len(py_files))
+
+    # Write each source file individually via exec (one per file, small
+    # command ≈6-10 KB each). This lands files in the REAL sandbox filesystem
+    # accessible to all subsequent `exec`-based code runs.
+    async def _write_file(dest: str, b64: str) -> None:
+        # Two separate calls: mkdir then write.
+        # Avoids && chaining and escaping issues in minimal sandbox shells.
+        dir_path = dest.rsplit("/", 1)[0]
+        await _aexec(sandbox, f"mkdir -p {dir_path}")
+        write_cmd = (
+            f"python3 -c \"import base64; "
+            f"open('{dest}','wb').write(base64.b64decode('{b64}'))\""
+        )
+        await _aexec(sandbox, write_cmd)
+
+    write_tasks = [
+        _write_file(
+            f"{_WORKSPACE}/{p.relative_to(_PROJECT_ROOT)}",
+            base64.b64encode(p.read_bytes()).decode(),
+        )
+        for p in py_files
+    ]
+    await asyncio.gather(*write_tasks)
+
+    # Verify files landed in the sandbox filesystem
+    check = await _aexec(sandbox, f"ls {_WORKSPACE}/app/ 2>&1 | head -5")
+    logger.info("Sandbox bootstrapped: %d files | app/ contents: %s", len(py_files), check.strip())
 
 
 # ─── Code template helpers ────────────────────────────────────────────────────
@@ -135,9 +151,10 @@ def _env_setup(req: RedTeamRequest) -> str:
     FAIRSIGHT_ENDPOINT — sourced entirely from the request, not server env.
     TAVILY_API_KEY is the only server-side key (recon web search).
     """
+    # PYTHONPATH=/workspace is set at the shell level in _acode_run, so
+    # `import app.*` works without any sys.path manipulation here.
     return "\n".join([
         "import os, sys, json, asyncio",
-        f"sys.path.insert(0, {repr(_WORKSPACE)})",
         f"os.environ['FAIRSIGHT_API_KEY']  = {repr(req.fairsight_api_key)}",
         f"os.environ['FAIRSIGHT_MODEL']    = {repr(req.fairsight_model)}",
         f"os.environ['FAIRSIGHT_ENDPOINT'] = {repr(req.fairsight_endpoint or '')}",
@@ -297,11 +314,7 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
         # ── Provision sandbox ─────────────────────────────────────────────────
         yield _sse({"phase": "sandbox", "status": "provisioning"})
 
-        loop = asyncio.get_event_loop()
-        sandbox = await loop.run_in_executor(
-            None,
-            lambda: daytona.create(CreateSandboxParams(language="python")),
-        )
+        sandbox = await daytona.create(CreateSandboxFromSnapshotParams(language="python"))
         logger.info("Sandbox created: id=%s", getattr(sandbox, "id", "?"))
 
         yield _sse({"phase": "sandbox", "status": "bootstrapping"})
@@ -381,8 +394,13 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
     finally:
         if sandbox is not None:
             try:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, lambda: daytona.remove(sandbox))
+                await daytona.delete(sandbox)
                 logger.info("Sandbox removed: id=%s", getattr(sandbox, "id", "?"))
             except Exception as exc:
                 logger.warning("Could not remove sandbox: %s", exc)
+        # Close the Daytona client's internal aiohttp session to avoid
+        # "Unclosed client session" warnings at process exit.
+        try:
+            await daytona.close()
+        except Exception:
+            pass

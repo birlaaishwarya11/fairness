@@ -3,26 +3,29 @@ llm_client.py
 Unified async LLM caller for FairSight's internal agents.
 
 Supports:
-  - Anthropic SDK  (claude-* models at api.anthropic.com)
-  - OpenAI-compatible APIs (Groq, OpenAI, Mistral, Gemini, Llama-API, etc.)
+  - Anthropic REST API  (claude-* models)
+  - OpenAI-compatible APIs (Groq, OpenAI, Mistral, Gemini, etc.)
 
-All agents use call_llm() so the same code works regardless of which
-provider the operator chooses for FairSight's internals.
+Uses only httpx — no provider SDK required. This keeps the Daytona
+sandbox lean: install httpx and whatever packages the TARGET model needs.
+Automatic retry with exponential backoff on 429 / 5xx errors.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
-import anthropic
 import httpx
 
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 60.0
+_MAX_RETRIES = 3
+_RETRY_DELAYS = [2, 5, 10]  # seconds
 
-# Infer endpoint from model name prefix (longest match wins)
+# Infer endpoint from model name (longest match wins)
 _MODEL_ENDPOINTS: list[tuple[str, str]] = [
     ("claude",    "https://api.anthropic.com/v1/messages"),
     ("gpt",       "https://api.openai.com/v1/chat/completions"),
@@ -41,7 +44,6 @@ _MODEL_ENDPOINTS: list[tuple[str, str]] = [
 
 
 def default_endpoint(model: str) -> str:
-    """Infer the API endpoint from the model name."""
     mid = model.lower()
     for prefix, url in _MODEL_ENDPOINTS:
         if prefix in mid:
@@ -53,6 +55,42 @@ def _is_anthropic_endpoint(endpoint: str) -> bool:
     return "anthropic.com" in endpoint
 
 
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    payload: dict,
+    headers: dict,
+) -> httpx.Response:
+    """POST with automatic retry on rate-limit / transient server errors."""
+    delays = iter([0] + _RETRY_DELAYS)
+    attempt = 0
+    while True:
+        wait = next(delays, _RETRY_DELAYS[-1])
+        if wait:
+            await asyncio.sleep(wait)
+        try:
+            resp = await client.post(endpoint, json=payload, headers=headers)
+        except httpx.RequestError as exc:
+            attempt += 1
+            if attempt > _MAX_RETRIES:
+                raise
+            logger.warning("LLM request error (attempt %d): %s — retrying", attempt, exc)
+            continue
+
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt < _MAX_RETRIES:
+            attempt += 1
+            retry_after = int(resp.headers.get("retry-after", _RETRY_DELAYS[min(attempt - 1, len(_RETRY_DELAYS) - 1)]))
+            logger.warning(
+                "LLM HTTP %d (attempt %d) — retrying in %ds",
+                resp.status_code, attempt, retry_after,
+            )
+            await asyncio.sleep(retry_after)
+            continue
+
+        resp.raise_for_status()
+        return resp
+
+
 async def _call_anthropic(
     messages: list[dict],
     model: str,
@@ -61,15 +99,23 @@ async def _call_anthropic(
     max_tokens: int,
     endpoint: str,
 ) -> str:
-    base_url = endpoint.rsplit("/messages", 1)[0] if "/messages" in endpoint else endpoint
-    client = anthropic.AsyncAnthropic(api_key=api_key, base_url=base_url)
-    resp = await client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        **({"system": system} if system else {}),
-        messages=messages,
-    )
-    return resp.content[0].text if resp.content else ""
+    """Call Anthropic REST API directly via httpx (no SDK required)."""
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload: dict = {"model": model, "max_tokens": max_tokens, "messages": messages}
+    if system:
+        payload["system"] = system
+
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await _post_with_retry(client, endpoint, payload, headers)
+        data = resp.json()
+        content = data.get("content", [])
+        if content:
+            return content[0].get("text", "") or ""
+    return ""
 
 
 async def _call_openai_compat(
@@ -80,6 +126,7 @@ async def _call_openai_compat(
     max_tokens: int,
     endpoint: str,
 ) -> str:
+    """Call any OpenAI-compatible REST API via httpx."""
     payload_messages: list[dict] = []
     if system:
         payload_messages.append({"role": "system", "content": system})
@@ -89,15 +136,10 @@ async def _call_openai_compat(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "model": model,
-        "messages": payload_messages,
-        "max_tokens": max_tokens,
-    }
+    payload = {"model": model, "messages": payload_messages, "max_tokens": max_tokens}
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.post(endpoint, json=payload, headers=headers)
-        resp.raise_for_status()
+        resp = await _post_with_retry(client, endpoint, payload, headers)
         data = resp.json()
         choices = data.get("choices", [])
         if choices:
@@ -115,21 +157,11 @@ async def call_llm(
     endpoint: Optional[str] = None,
 ) -> str:
     """
-    Unified async LLM call supporting Anthropic and OpenAI-compatible APIs.
-
-    Args:
-        messages:   Chat messages [{"role": "user", "content": "..."}]
-        model:      Model name  e.g. "claude-opus-4-6" or "llama-3.3-70b-versatile"
-        api_key:    Provider API key
-        system:     System prompt (mapped correctly for each provider)
-        max_tokens: Max response tokens
-        endpoint:   Override endpoint URL; inferred from model name if omitted
-
-    Returns:
-        Model response as a plain string.
+    Unified async LLM call — Anthropic and OpenAI-compatible.
+    Pure httpx: no provider SDK needed in the sandbox.
+    Retries automatically on 429 / 5xx with exponential backoff.
     """
     resolved = endpoint or default_endpoint(model)
-
     if _is_anthropic_endpoint(resolved):
         return await _call_anthropic(messages, model, api_key, system, max_tokens, resolved)
     return await _call_openai_compat(messages, model, api_key, system, max_tokens, resolved)

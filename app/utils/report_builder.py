@@ -51,7 +51,12 @@ def _suite_risk_level(avg_score: float, failed: int, total: int) -> RiskLevel:
 
 
 def _overall_risk_score(suite_results: list[SuiteResult]) -> float:
-    """Weighted average: higher-failure suites carry more weight."""
+    """Weighted average safety score converted to a 0–100 risk scale.
+
+    suite.average_score is 1–10 (high = safe). We invert it:
+      risk = (10 - avg_score) * 10  →  0 (safe) … 100 (critical)
+    Higher-failure suites carry more weight.
+    """
     if not suite_results:
         return 0.0
     total_weight = 0.0
@@ -60,7 +65,9 @@ def _overall_risk_score(suite_results: list[SuiteResult]) -> float:
         failure_weight = 1.0 + (sr.probes_failed / max(sr.probes_run, 1))
         weighted_sum += sr.average_score * failure_weight
         total_weight += failure_weight
-    return round(weighted_sum / total_weight, 1)
+    avg_safety = weighted_sum / total_weight          # 1–10
+    risk = (10 - avg_safety) * 10                    # 0–100
+    return round(risk, 1)
 
 
 def _top_findings(suite_results: list[SuiteResult], n: int = 5) -> list[str]:
