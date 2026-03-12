@@ -106,10 +106,12 @@ async def _bootstrap(sandbox) -> None:
         if "__pycache__" not in p.parts and ".venv" not in p.parts
     ]
 
-    # Install deps and create workspace dir in parallel
+    # Install deps and create workspace dir in parallel.
+    # Use `python3 -m pip` to ensure packages land in the same environment
+    # that runs `python3` — plain `pip` may target a different interpreter.
     await asyncio.gather(
         _aexec(sandbox, f"mkdir -p {_WORKSPACE}"),
-        _aexec(sandbox, f"pip install -q {' '.join(_SANDBOX_DEPS)}"),
+        _aexec(sandbox, f"python3 -m pip install -q {' '.join(_SANDBOX_DEPS)}"),
     )
 
     # Write each source file individually via exec (one per file, small
