@@ -15,6 +15,7 @@ Routes:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -60,27 +61,63 @@ app.add_middleware(
 
 # ─── Pipeline stream ──────────────────────────────────────────────────────────
 
+_SSE_KEEPALIVE = ": ping\n\n"  # SSE comment — invisible to app, resets all timeouts
+_KEEPALIVE_INTERVAL = 5        # seconds between pings
+
+
 async def _stream_pipeline(req: RedTeamRequest):
     """
-    Async generator that delegates to the Daytona sandbox runner.
-    Intercepts the final 'report/complete' event to persist the report,
-    then re-yields it so the client receives it unchanged.
-    """
-    async for sse_str in run_pipeline_in_sandbox(req):
-        # Check for the final report so we can store it server-side
-        if sse_str.startswith("data: "):
-            try:
-                event = json.loads(sse_str[6:])
-                if event.get("phase") == "report" and event.get("status") == "complete":
-                    report = FinalReport.model_validate(event["data"])
-                    _reports[report.report_id] = report
-                    logger.info(
-                        "Stored report %s (target=%s)", report.report_id, req.target
-                    )
-            except Exception:
-                pass  # never block the stream on a storage error
+    Wraps the sandbox pipeline with a background keepalive task.
 
-        yield sse_str
+    A separate coroutine sends `: ping` SSE comment lines every 5 seconds
+    so the connection never goes silent long enough for Lovable (or any
+    intermediate proxy) to declare it dead.  Pipeline events are forwarded
+    via an asyncio.Queue so both producers share one consumer loop.
+    """
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def _pipeline_producer() -> None:
+        try:
+            async for sse_str in run_pipeline_in_sandbox(req):
+                # Persist the final report server-side
+                if sse_str.startswith("data: "):
+                    try:
+                        event = json.loads(sse_str[6:])
+                        if event.get("phase") == "report" and event.get("status") == "complete":
+                            report = FinalReport.model_validate(event["data"])
+                            _reports[report.report_id] = report
+                            logger.info("Stored report %s (target=%s)", report.report_id, req.target)
+                    except Exception:
+                        pass
+                await queue.put(sse_str)
+        except Exception as exc:
+            logger.error("Pipeline producer error: %s", exc)
+        finally:
+            await queue.put(None)  # sentinel — tells consumer to stop
+
+    async def _keepalive_producer() -> None:
+        while True:
+            await asyncio.sleep(_KEEPALIVE_INTERVAL)
+            await queue.put(_SSE_KEEPALIVE)
+
+    pipeline_task = asyncio.create_task(_pipeline_producer())
+    keepalive_task = asyncio.create_task(_keepalive_producer())
+
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+    finally:
+        pipeline_task.cancel()
+        keepalive_task.cancel()
+        # Drain exceptions from cancelled tasks silently
+        for t in (pipeline_task, keepalive_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
