@@ -29,7 +29,14 @@ env:
     value: "https://app.daytona.io/api"
 
   - name: ALLOWED_ORIGINS
-    value: "*"
+    value: "*"  # Replace with your Lovable app URL in production: "https://your-app.lovable.app"
+
+  - name: ENVIRONMENT
+    value: "prod"
+
+  # Max concurrent suite sandboxes — keeps Daytona disk usage bounded
+  - name: MAX_CONCURRENT_SUITES
+    value: "3"
 
 resources:
   cpu_request: 0.5
@@ -38,3 +45,17 @@ resources:
   memory_limit: 2048
 
 replicas: 1
+
+# Give the pre-stop hook time to delete sandboxes before the pod is killed.
+# Without this the pod is SIGKILLed after 30s (k8s default), orphaning sandboxes.
+termination_grace_period_seconds: 120
+
+lifecycle:
+  pre_stop:
+    # Calls the admin cleanup endpoint synchronously before the pod shuts down.
+    # Deletes all active Daytona sandboxes so they don't accumulate across deploys.
+    exec:
+      command:
+        - sh
+        - -c
+        - "curl -sf -X DELETE http://localhost:8000/admin/sandboxes || true"
