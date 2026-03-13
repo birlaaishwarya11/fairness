@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 _MAX_RESPONSE_CHARS = 2000
 
 
+# Exponential backoff waits for rate-limited probe retries.
+# Groq's free-tier TPM window resets every 60s, so we wait long enough to clear it.
+_PROBE_RATE_LIMIT_WAITS = [30, 60, 90]
+
+
 async def execute_probe(
     probe: str,
     target: str,
@@ -30,23 +35,35 @@ async def execute_probe(
 ) -> tuple[str, str]:
     """
     Execute a single probe against the target model.
+    On rate-limit (429) retries with exponential backoff before giving up.
     Returns (probe, response) tuple.
     """
-    try:
-        response = await call_llm(
-            messages=[{"role": "user", "content": probe}],
-            model=model_id,
-            api_key=api_key,
-            max_tokens=1024,
-            endpoint=endpoint or None,
-        )
-    except RateLimitError:
-        # Skip immediately — don't hang the suite waiting for retries
-        logger.warning("Target model rate-limited — skipping probe for '%s'", target)
-        return probe, "[Probe skipped — target model is rate limited. Retry with a higher-quota API key.]"
-    except Exception as exc:
-        logger.error("Probe execution failed for target '%s': %s", target, exc)
-        response = f"[Execution error: {exc}]"
+    response: str = ""
+    for attempt, wait in enumerate([0] + _PROBE_RATE_LIMIT_WAITS):
+        if wait:
+            logger.warning(
+                "Target rate-limited — waiting %ds before retry %d/%d (probe: %.60s…)",
+                wait, attempt, len(_PROBE_RATE_LIMIT_WAITS), probe,
+            )
+            await asyncio.sleep(wait)
+        try:
+            response = await call_llm(
+                messages=[{"role": "user", "content": probe}],
+                model=model_id,
+                api_key=api_key,
+                max_tokens=512,
+                endpoint=endpoint or None,
+            )
+            break  # success
+        except RateLimitError:
+            if attempt >= len(_PROBE_RATE_LIMIT_WAITS):
+                logger.error("Target model rate-limited after %d retries — skipping probe", attempt)
+                return probe, "[Probe skipped — target model is rate limited. Retry with a higher-quota API key.]"
+            # Loop continues with next wait
+        except Exception as exc:
+            logger.error("Probe execution failed for target '%s': %s", target, exc)
+            response = f"[Execution error: {exc}]"
+            break
 
     if not response:
         response = "[No response received from target model]"

@@ -22,9 +22,9 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_TIMEOUT = 30.0       # per-request httpx timeout — fail fast, don't hang suites
-_MAX_RETRIES = 1      # one retry only; more retries cause 270s+ hangs under rate limits
-_RETRY_DELAYS = [5]   # single delay before the one retry
+_TIMEOUT = 30.0          # per-request httpx timeout
+_MAX_RETRIES = 2         # up to 2 retries on 429/5xx
+_RETRY_DELAYS = [5, 30]  # 5s then 30s before the two retries
 
 # ── Groq rate-limit guard ─────────────────────────────────────────────────────
 # Groq free tier = 30 RPM on llama-3.3-70b-versatile.
@@ -121,11 +121,12 @@ async def _post_with_retry(
         if resp.status_code == 429:
             if attempt < _MAX_RETRIES:
                 attempt += 1
-                retry_after = min(int(resp.headers.get("retry-after", _RETRY_DELAYS[0])), 15)
+                # Honor Retry-After header up to 120s; fall back to exponential delay
+                fallback = _RETRY_DELAYS[min(attempt - 1, len(_RETRY_DELAYS) - 1)]
+                retry_after = min(int(resp.headers.get("retry-after", fallback)), 120)
                 logger.warning("LLM 429 rate-limited (attempt %d) — retrying in %ds", attempt, retry_after)
                 await asyncio.sleep(retry_after)
                 continue
-            # Retries exhausted on 429 — raise immediately so executor can skip
             raise RateLimitError(f"Rate limited after {attempt + 1} attempts (HTTP 429)")
 
         if resp.status_code in (500, 502, 503, 504) and attempt < _MAX_RETRIES:

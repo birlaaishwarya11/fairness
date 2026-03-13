@@ -64,17 +64,49 @@ def _findings_from_results(results: list[dict]) -> list[Finding]:
 
 # ─── Search Queries ───────────────────────────────────────────────────────────
 
+# Map model name prefixes → human-readable provider+family for better Tavily results
+_MODEL_FAMILY_MAP: list[tuple[str, str]] = [
+    ("gpt",      "OpenAI GPT"),
+    ("o1",       "OpenAI o1"),
+    ("o3",       "OpenAI o3"),
+    ("claude",   "Anthropic Claude"),
+    ("llama",    "Meta Llama"),
+    ("gemma",    "Google Gemma"),
+    ("gemini",   "Google Gemini"),
+    ("mistral",  "Mistral AI"),
+    ("mixtral",  "Mistral MoE"),
+    ("qwen",     "Alibaba Qwen"),
+    ("deepseek", "DeepSeek"),
+    ("phi",      "Microsoft Phi"),
+    ("falcon",   "TII Falcon"),
+    ("yi",       "01.AI Yi"),
+]
+
+
 def _normalize_target_for_search(target: str) -> str:
     """
-    Convert HuggingFace-style paths (org/model-name) to a search-friendly string.
-    e.g. "openai/gpt-oss-20b" → "OpenAI GPT-OSS-20B"
-         "meta-llama/Llama-3-8B" → "Meta-Llama Llama-3-8B"
-    Plain names and URLs are returned as-is.
+    Convert model IDs to search-friendly strings that return Tavily results.
+
+    Examples:
+      "llama-3.3-70b-versatile"   → "Meta Llama"
+      "openai/gpt-oss-20b"        → "OpenAI GPT"
+      "meta-llama/Llama-3-8B"     → "Meta Llama"
+      "claude-3-5-sonnet"         → "Anthropic Claude"
+      "my-private-model"          → "my-private-model"  (unknown, keep as-is)
     """
+    # Strip org prefix (HuggingFace-style)
+    name = target
     if "/" in target and not target.startswith("http"):
-        org, model = target.split("/", 1)
-        return f"{org.replace('-', ' ').title()} {model}"
-    return target
+        _, name = target.split("/", 1)
+
+    name_lower = name.lower()
+    for prefix, label in _MODEL_FAMILY_MAP:
+        if name_lower.startswith(prefix) or f"-{prefix}" in name_lower:
+            return label
+
+    # Unknown model — strip version noise (digits, dots, dashes) and title-case
+    base = re.sub(r"[-_][\d.]+[a-z\-]*$", "", name, flags=re.IGNORECASE)
+    return base.replace("-", " ").replace("_", " ").title() if base else target
 
 
 def _build_queries(target: str) -> list[tuple[str, str]]:
