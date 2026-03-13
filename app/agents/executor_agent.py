@@ -21,9 +21,10 @@ logger = logging.getLogger(__name__)
 _MAX_RESPONSE_CHARS = 2000
 
 
-# Exponential backoff waits for rate-limited probe retries.
-# Groq's free-tier TPM window resets every 60s, so we wait long enough to clear it.
-_PROBE_RATE_LIMIT_WAITS = [30, 60, 90]
+# Backoff waits for rate-limited probe retries (2 retries only).
+# Kept short so total probe time fits inside _SUITE_TIMEOUT.
+# Budget: attacker(35s) + 3 probes × (15+30)s = ~170s < 300s suite timeout.
+_PROBE_RATE_LIMIT_WAITS = [15, 30]
 
 
 async def execute_probe(

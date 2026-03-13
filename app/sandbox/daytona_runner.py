@@ -320,7 +320,7 @@ from app.agents.executor_agent import execute_probes_batch
 from app.agents.judge_agent import judge_suite
 from app.models.schemas import TestSuite, ReconReport, AuditConfig
 
-_SUITE_TIMEOUT = 180  # 3 minutes — leaves 300s cleanup headroom within _acode_run's 480s max_wait
+_SUITE_TIMEOUT = 300  # 5 minutes — fits attacker(35s) + 3 probes×(15+30)s retries + judge(60s)
 
 async def _run():
     suite = TestSuite.model_validate(_json.loads({repr(suite_json)}))
@@ -426,10 +426,12 @@ async def _teardown_worker(daytona, sandbox) -> None:
         logger.info("Worker sandbox removed: id=%s", getattr(sandbox, "id", "?"))
     except Exception as exc:
         logger.warning("Could not remove worker sandbox: %s", exc)
-    try:
-        await daytona.close()
-    except Exception:
-        pass
+    finally:
+        # Always close the aiohttp session — prevents "Unclosed client session" warnings
+        try:
+            await daytona.close()
+        except Exception:
+            pass
 
 
 async def _run_suite_on_worker(
@@ -441,7 +443,7 @@ async def _run_suite_on_worker(
 ) -> dict:
     """Run one suite on a pre-bootstrapped worker sandbox and return result dict."""
     env = _env_setup(req)
-    # max_wait=480: suite inner timeout=180s + up to 300s for httpx cleanup on cancellation
+    # max_wait=480: suite inner timeout=300s + 180s cleanup headroom after cancellation
     raw = await _acode_run(sandbox, _suite_code(req, suite_data, recon_data, env), max_wait=480)
     return _parse_result(raw)
 
@@ -693,10 +695,11 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest, session: Optional[Any] = 
                 logger.info("Orchestrator sandbox removed: id=%s", getattr(orch_sandbox, "id", "?"))
             except Exception as exc:
                 logger.warning("Could not remove orchestrator sandbox: %s", exc)
-        try:
-            await daytona.close()
-        except Exception:
-            pass
+            finally:
+                try:
+                    await daytona.close()
+                except Exception:
+                    pass
         # ── Tear down all remaining worker sandboxes ───────────────────────────
         for w_daytona, w_sandbox in worker_pool:
             await _teardown_worker(w_daytona, w_sandbox)
