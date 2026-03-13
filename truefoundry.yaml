@@ -38,6 +38,10 @@ env:
   - name: MAX_CONCURRENT_SUITES
     value: "3"
 
+  # Prevents Python from writing .pyc files — avoids stale bytecode across deploys
+  - name: PYTHONDONTWRITEBYTECODE
+    value: "1"
+
 resources:
   cpu_request: 0.5
   cpu_limit: 2
