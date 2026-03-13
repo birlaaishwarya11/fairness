@@ -64,28 +64,42 @@ def _findings_from_results(results: list[dict]) -> list[Finding]:
 
 # ─── Search Queries ───────────────────────────────────────────────────────────
 
+def _normalize_target_for_search(target: str) -> str:
+    """
+    Convert HuggingFace-style paths (org/model-name) to a search-friendly string.
+    e.g. "openai/gpt-oss-20b" → "OpenAI GPT-OSS-20B"
+         "meta-llama/Llama-3-8B" → "Meta-Llama Llama-3-8B"
+    Plain names and URLs are returned as-is.
+    """
+    if "/" in target and not target.startswith("http"):
+        org, model = target.split("/", 1)
+        return f"{org.replace('-', ' ').title()} {model}"
+    return target
+
+
 def _build_queries(target: str) -> list[tuple[str, str]]:
     """Return (category, query) tuples for the five recon dimensions."""
+    search_name = _normalize_target_for_search(target)
     return [
         (
             "known_vulnerabilities",
-            f"{target} AI bias incident vulnerability exploit 2025 2026",
+            f"{search_name} AI bias incident vulnerability exploit 2025 2026",
         ),
         (
             "academic_critiques",
-            f"{target} fairness benchmark failure research paper arxiv",
+            f"{search_name} fairness benchmark failure research paper arxiv",
         ),
         (
             "regulatory_exposure",
-            f"{target} GDPR EU AI Act lawsuit regulatory fine",
+            f"{search_name} GDPR EU AI Act lawsuit regulatory fine",
         ),
         (
             "demographic_gaps",
-            f"{target} demographic disparity accuracy gap race gender language",
+            f"{search_name} demographic disparity accuracy gap race gender language",
         ),
         (
             "architecture",
-            f"{target} powered by AI model technology OpenAI Anthropic",
+            f"{search_name} powered by AI model technology OpenAI Anthropic",
         ),
     ]
 
@@ -221,9 +235,29 @@ async def run_recon(target: str) -> ReconReport:
         combined_text = " ".join(r.get("content", "") for r in arch_results)
         detected_models = detect_models_from_text(combined_text)
 
-    most_concerning, missing_coverage, recon_summary = await _synthesise(
-        display_target, categorised
-    )
+    total_findings = sum(len(v) for v in categorised.values())
+    if total_findings == 0:
+        # No public record found — skip LLM synthesis, return a generic report.
+        # This avoids burning TPM on an LLM call with empty inputs.
+        search_name = _normalize_target_for_search(display_target)
+        most_concerning = (
+            f"No public bias or safety incidents found for {search_name}. "
+            "The model may be new, private, or under a different name."
+        )
+        missing_coverage = (
+            "All public dimensions returned zero results — training data composition, "
+            "internal evaluations, and deployment context are unknown."
+        )
+        recon_summary = (
+            f"No public findings were found for '{display_target}'. "
+            "The red team plan will be generated from general best-practice attack patterns "
+            f"rather than target-specific intelligence. If this is a new or private model, "
+            "consider providing more context in the target name (e.g., the provider or use case)."
+        )
+    else:
+        most_concerning, missing_coverage, recon_summary = await _synthesise(
+            display_target, categorised
+        )
 
     return ReconReport(
         target=display_target,
