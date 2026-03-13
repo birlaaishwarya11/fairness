@@ -89,30 +89,53 @@ async def _with_heartbeat(coro, phase: str, interval: float = 10.0):
     yield task.result()  # raises if task raised
 
 
-async def _acode_run(sandbox, code: str) -> str:
-    """Run Python code via shell exec — write to a temp file, then execute.
+async def _acode_run(sandbox, code: str, poll_interval: float = 3.0, max_wait: int = 360) -> str:
+    """Run Python code in the sandbox via a background process + polling.
 
-    Avoids all shell-quoting / -c escaping issues. Uses `env PYTHONPATH=`
-    instead of inline VAR=val so it works in any POSIX shell.
-    stderr is merged into stdout (2>&1) so phase errors appear in the output
-    and are caught by _parse_result.
+    Avoids Daytona's per-exec timeout entirely: the script runs detached
+    (nohup ... &) so the exec call that launches it returns immediately.
+    We then poll for a 'done' marker file every poll_interval seconds.
+    Each poll exec is short-lived and cannot timeout.
+
+    max_wait: total seconds to wait before giving up (default 6 min).
     """
-    # Use a unique temp file per invocation so parallel suite runs don't
-    # overwrite each other's code before execution.
-    tmp = f"/tmp/_fs_{uuid.uuid4().hex}.py"
+    uid = uuid.uuid4().hex
+    tmp = f"/tmp/_fs_{uid}.py"
+    out = f"/tmp/_fs_out_{uid}.txt"
+    done = f"/tmp/_fs_done_{uid}"
+
     encoded = base64.b64encode(code.encode()).decode()
-    # Step 1: write the code to a unique temp file
+
+    # Step 1: write the code file
     write_cmd = (
         f"python3 -c \"import base64; "
         f"open('{tmp}','w').write(base64.b64decode('{encoded}').decode())\""
     )
     await sandbox.process.exec(write_cmd, timeout=30)
-    # Step 2: run the temp file with PYTHONPATH set.
-    # timeout=0 means no timeout — phase scripts call LLMs and can take 60-180s.
-    # Without this, Daytona's default aiohttp timeout kills the exec mid-flight.
-    run_cmd = f"env PYTHONPATH={_WORKSPACE} python3 {tmp} 2>&1"
-    result = await sandbox.process.exec(run_cmd, timeout=None)
-    return getattr(result, "output", "") or getattr(result, "result", "") or ""
+
+    # Step 2: launch in background — exec returns immediately
+    bg_cmd = (
+        f"nohup sh -c "
+        f"'env PYTHONPATH={_WORKSPACE} python3 {tmp} > {out} 2>&1; touch {done}' "
+        f"> /dev/null 2>&1 &"
+    )
+    await sandbox.process.exec(bg_cmd, timeout=10)
+
+    # Step 3: poll until done marker appears
+    polls = int(max_wait / poll_interval)
+    for _ in range(polls):
+        await asyncio.sleep(poll_interval)
+        check = await sandbox.process.exec(
+            f"test -f {done} && echo done || echo waiting", timeout=10
+        )
+        if (getattr(check, "output", "") or "").strip() == "done":
+            break
+    else:
+        logger.warning("_acode_run: timed out after %ds waiting for %s", max_wait, done)
+
+    # Step 4: read output file
+    read_result = await sandbox.process.exec(f"cat {out} 2>/dev/null || echo ''", timeout=15)
+    return (getattr(read_result, "output", "") or getattr(read_result, "result", "") or "").strip()
 
 
 # ─── Sandbox bootstrap ────────────────────────────────────────────────────────

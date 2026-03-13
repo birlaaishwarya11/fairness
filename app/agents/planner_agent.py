@@ -194,59 +194,90 @@ def _parse_plan(raw_text: str, target_suites: int) -> RedTeamPlan:
     )
 
 
-def _fallback_plan(recon: ReconReport, target_suites: int) -> RedTeamPlan:
-    """Return a sensible default plan if Claude call fails."""
-    default_suites = [
+def _fallback_plan(recon: ReconReport, target_suites: int, audit_config: AuditConfig | None = None) -> RedTeamPlan:
+    """Return a sensible default plan if Claude call fails, respecting audit_config constraints."""
+    default_probes = _DEPTH_DEFAULT_PROBES.get(Depth.QUICK, 3)
+    all_suites = [
         TestSuite(
             suite_name="Demographic Bias in Core Responses",
             rationale="High-priority bias testing based on recon findings.",
             probe_category=ProbeCategory.DEMOGRAPHIC,
             severity_expected=Severity.HIGH,
-            num_probes=7,
+            num_probes=default_probes,
         ),
         TestSuite(
             suite_name="Jailbreak via Role-Play Injection",
             rationale="Common attack vector for any LLM-based system.",
             probe_category=ProbeCategory.JAILBREAK,
             severity_expected=Severity.HIGH,
-            num_probes=7,
+            num_probes=default_probes,
         ),
         TestSuite(
             suite_name="Toxic Content Generation",
             rationale="Assess whether the model can be coerced into harmful outputs.",
             probe_category=ProbeCategory.TOXICITY,
             severity_expected=Severity.MEDIUM,
-            num_probes=5,
+            num_probes=default_probes,
         ),
         TestSuite(
             suite_name="PII Extraction and Leakage",
             rationale="Regulatory exposure identified in recon warrants PII testing.",
             probe_category=ProbeCategory.PII,
             severity_expected=Severity.HIGH,
-            num_probes=6,
+            num_probes=default_probes,
         ),
         TestSuite(
             suite_name="Hallucination in High-Stakes Domains",
             rationale="Factual accuracy failures cited in academic literature.",
             probe_category=ProbeCategory.HALLUCINATION,
             severity_expected=Severity.MEDIUM,
-            num_probes=6,
+            num_probes=default_probes,
         ),
         TestSuite(
             suite_name="Racial Bias in Hiring Recommendations",
             rationale="Demographic disparity findings from recon indicate occupational bias risk.",
             probe_category=ProbeCategory.BIAS,
             severity_expected=Severity.HIGH,
-            num_probes=8,
+            num_probes=default_probes,
+        ),
+        TestSuite(
+            suite_name="Prompt Injection via User Content",
+            rationale="Test whether adversarial content in inputs can override instructions.",
+            probe_category=ProbeCategory.PROMPT_INJECTION,
+            severity_expected=Severity.HIGH,
+            num_probes=default_probes,
         ),
     ]
+
+    # Apply audit_config filters to the fallback just like the planner would
+    if audit_config:
+        if audit_config.focus_categories:
+            allowed = set(audit_config.focus_categories)
+            all_suites = [s for s in all_suites if s.probe_category in allowed]
+        if audit_config.excluded_categories:
+            excluded = set(audit_config.excluded_categories)
+            all_suites = [s for s in all_suites if s.probe_category not in excluded]
+        if audit_config.min_probes_per_suite:
+            for s in all_suites:
+                s.num_probes = max(s.num_probes, audit_config.min_probes_per_suite)
+
+    # If filtering removed all suites, fall back to the focused category or first suite
+    if not all_suites:
+        all_suites = [TestSuite(
+            suite_name="General Adversarial Probing",
+            rationale="Fallback suite — category filter matched no defaults.",
+            probe_category=ProbeCategory.BIAS,
+            severity_expected=Severity.MEDIUM,
+            num_probes=default_probes,
+        )]
+
     return RedTeamPlan(
         plan_summary=(
-            f"Comprehensive red team plan for {recon.target} covering bias, jailbreak, "
-            "toxicity, PII, hallucination, and demographic dimensions."
+            f"Fallback red team plan for {recon.target} "
+            f"({len(all_suites[:target_suites])} suites)."
         ),
         priority_areas=["Bias", "Jailbreak", "Regulatory Compliance"],
-        test_suites=default_suites[:target_suites],
+        test_suites=all_suites[:target_suites],
     )
 
 
@@ -272,7 +303,7 @@ async def run_planning(recon: ReconReport, depth: Depth, audit_config: AuditConf
 
         # Ensure we have the right number of suites (pad if needed)
         if len(plan.test_suites) < target_suites:
-            fallback = _fallback_plan(recon, target_suites)
+            fallback = _fallback_plan(recon, target_suites, audit_config)
             missing = target_suites - len(plan.test_suites)
             plan.test_suites.extend(fallback.test_suites[:missing])
 
@@ -285,4 +316,4 @@ async def run_planning(recon: ReconReport, depth: Depth, audit_config: AuditConf
 
     except Exception as exc:
         logger.error("Planning agent failed: %s — using fallback plan", exc)
-        return _fallback_plan(recon, target_suites)
+        return _fallback_plan(recon, target_suites, audit_config)
