@@ -340,7 +340,7 @@ async def _run():
         target={repr(req.target)},
         model_id={repr(req.resolved_model_id)},
         api_key={repr(req.target_api_key)},
-        endpoint={repr(req.target_endpoint)},
+        endpoint={repr(req.resolved_target_endpoint)},
     )
     result = await judge_suite(suite, pairs)
     return result.model_dump_json()

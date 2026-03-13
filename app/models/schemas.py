@@ -155,6 +155,35 @@ class RedTeamRequest(BaseModel):
         return self.model_name
 
     @property
+    def resolved_target_endpoint(self) -> Optional[str]:
+        """
+        Resolve the target API endpoint.
+
+        Priority:
+          1. Explicit target_endpoint field
+          2. Inferred from target_api_key prefix (key format is provider-specific)
+          3. None → call_llm will infer from model name via default_endpoint()
+
+        This prevents the common mistake of a Groq key being sent to api.openai.com
+        because the model name happens to contain 'gpt' or 'o1'.
+        """
+        if self.target_endpoint:
+            return self.target_endpoint
+
+        key = self.target_api_key or ""
+        # Groq keys start with gsk_
+        if key.startswith("gsk_"):
+            return "https://api.groq.com/openai/v1/chat/completions"
+        # Anthropic keys start with sk-ant-
+        if key.startswith("sk-ant-"):
+            return "https://api.anthropic.com/v1/messages"
+        # OpenAI keys start with sk- (but NOT sk-ant-)
+        if key.startswith("sk-"):
+            return "https://api.openai.com/v1/chat/completions"
+        # Unknown key format — let call_llm infer from model name
+        return None
+
+    @property
     def target(self) -> str:
         """Human-readable target label used for recon queries and reports."""
         if self.model_version:
