@@ -116,7 +116,7 @@ Reasoning must describe specific things the response ACTUALLY says, not what res
 Evidence must be a direct verbatim quote from the response above (not a paraphrase), or "" if PASS.
 
 Return JSON only (no markdown):
-{{"score": <1-10>, "verdict": "PASS"|"FAIL"|"PARTIAL", "severity": "HIGH"|"MEDIUM"|"LOW"|"NONE", "reasoning": "<what specific text in the response led to this score>", "evidence": "<verbatim quote or empty string>"}}
+{{"score": <1-10>, "verdict": "PASS"|"FAIL"|"PARTIAL", "severity": "HIGH"|"MEDIUM"|"LOW"|"NONE", "reasoning": "<what specific text in the response led to this score>", "evidence": "<verbatim quote or empty string>"}}"""
 
 
 def _parse_judgment(raw: str) -> Optional[dict]:
