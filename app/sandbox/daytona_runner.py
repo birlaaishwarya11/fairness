@@ -66,7 +66,7 @@ def _make_client() -> AsyncDaytona:
 
 async def _aexec(sandbox, cmd: str) -> str:
     result = await sandbox.process.exec(cmd)
-    return getattr(result, "output", "") or ""
+    return getattr(result, "output", "") or getattr(result, "result", "") or ""
 
 
 async def _with_heartbeat(coro, phase: str, interval: float = 10.0):
@@ -113,22 +113,36 @@ async def _acode_run(sandbox, code: str, poll_interval: float = 3.0, max_wait: i
     )
     await sandbox.process.exec(write_cmd, timeout=30)
 
-    # Step 2: launch in background — exec returns immediately
+    # Step 2: launch in a new session so it survives the parent shell exiting.
+    # nohup alone only blocks SIGHUP; setsid creates a new process group so
+    # SIGTERM from the exec session's shell death doesn't reach the child.
+    # We capture the PID so we can detect early process death during polling.
+    pid_file = f"/tmp/_fs_pid_{uid}"
     bg_cmd = (
-        f"nohup sh -c "
+        f"setsid sh -c "
         f"'env PYTHONPATH={_WORKSPACE} python3 {tmp} > {out} 2>&1; touch {done}' "
-        f"> /dev/null 2>&1 &"
+        f"> /dev/null 2>&1 & echo $! > {pid_file}"
     )
     await sandbox.process.exec(bg_cmd, timeout=10)
 
-    # Step 3: poll until done marker appears
+    # Step 3: poll until done marker appears; bail early if process died
+    pid_result = await sandbox.process.exec(f"cat {pid_file} 2>/dev/null || echo ''", timeout=10)
+    pid = (getattr(pid_result, "output", "") or getattr(pid_result, "result", "") or "").strip()
+
     polls = int(max_wait / poll_interval)
     for _ in range(polls):
         await asyncio.sleep(poll_interval)
-        check = await sandbox.process.exec(
-            f"test -f {done} && echo done || echo waiting", timeout=10
+        check_cmd = (
+            f"if [ -f {done} ]; then echo done; "
+            f"elif [ -n '{pid}' ] && ! kill -0 {pid} 2>/dev/null; then echo dead; "
+            f"else echo running; fi"
         )
-        if (getattr(check, "output", "") or "").strip() == "done":
+        check = await sandbox.process.exec(check_cmd, timeout=10)
+        status = (getattr(check, "output", "") or getattr(check, "result", "") or "").strip()
+        if status == "done":
+            break
+        if status == "dead":
+            logger.warning("_acode_run: background process (pid=%s) died without done-file — reading partial output", pid)
             break
     else:
         logger.warning("_acode_run: timed out after %ds waiting for %s", max_wait, done)
