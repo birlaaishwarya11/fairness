@@ -306,7 +306,7 @@ from app.agents.executor_agent import execute_probes_batch
 from app.agents.judge_agent import judge_suite
 from app.models.schemas import TestSuite, ReconReport, AuditConfig
 
-_SUITE_TIMEOUT = 240  # 4 minutes max per suite — prevents hangs on rate limits
+_SUITE_TIMEOUT = 180  # 3 minutes — leaves 300s cleanup headroom within _acode_run's 480s max_wait
 
 async def _run():
     suite = TestSuite.model_validate(_json.loads({repr(suite_json)}))
@@ -405,7 +405,8 @@ async def _run_suite_on_worker(
 ) -> dict:
     """Run one suite on a pre-bootstrapped worker sandbox and return result dict."""
     env = _env_setup(req)
-    raw = await _acode_run(sandbox, _suite_code(req, suite_data, recon_data, env))
+    # max_wait=480: suite inner timeout=180s + up to 300s for httpx cleanup on cancellation
+    raw = await _acode_run(sandbox, _suite_code(req, suite_data, recon_data, env), max_wait=480)
     return _parse_result(raw)
 
 
