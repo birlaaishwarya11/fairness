@@ -27,7 +27,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
 
 from daytona_sdk import AsyncDaytona, DaytonaConfig, CreateSandboxFromSnapshotParams
 
@@ -381,6 +381,28 @@ def _sse(event: dict) -> str:
     return f"data: {json.dumps(event)}\n\n"
 
 
+async def _pause_checkpoint(session: Optional[Any], phase: str) -> AsyncIterator[str]:
+    """
+    If the session is paused (or becomes paused), emit a `paused` event,
+    block until resumed, then emit a `resumed` event.
+    Safe to call even when session is None.
+    """
+    if session is None:
+        return
+    if session.is_paused:
+        yield _sse({
+            "phase": "pipeline", "status": "paused",
+            "reason": session.paused_reason or "manual",
+            "session_id": session.session_id,
+            "checkpoint": phase,
+        })
+        await session.wait_if_paused()
+        yield _sse({
+            "phase": "pipeline", "status": "resumed",
+            "session_id": session.session_id,
+        })
+
+
 # ─── Worker sandbox helpers ───────────────────────────────────────────────────
 
 async def _provision_worker(req: RedTeamRequest) -> tuple:
@@ -426,7 +448,7 @@ async def _run_suite_on_worker(
 
 # ─── Main pipeline runner ─────────────────────────────────────────────────────
 
-async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
+async def run_pipeline_in_sandbox(req: RedTeamRequest, session: Optional[Any] = None) -> AsyncIterator[str]:
     """
     Orchestrator: coordinates the 4-phase pipeline, streams SSE events.
 
@@ -483,6 +505,10 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
         recon_data = _parse_result(raw)
         yield _sse({"phase": "recon", "status": "complete", "data": recon_data})
 
+        # Pause checkpoint between recon → planning
+        async for ev in _pause_checkpoint(session, "before_planning"):
+            yield ev
+
         # ── Phase 2: Planning ─────────────────────────────────────────────────
         yield _sse({"phase": "planning", "status": "started"})
         async for tick in _with_heartbeat(_acode_run(orch_sandbox, _plan_code(req, recon_data, env)), "planning"):
@@ -492,6 +518,10 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
                 yield _sse(tick)
         plan_data = _parse_result(raw)
         yield _sse({"phase": "planning", "status": "complete", "data": plan_data})
+
+        # Pause checkpoint between planning → execution
+        async for ev in _pause_checkpoint(session, "before_execution"):
+            yield ev
 
         # ── Phase 3: Execution — dispatch suites to pre-warmed workers ────────
         suites = plan_data.get("test_suites", [])
@@ -575,6 +605,39 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
                         "status": "complete",
                         "data": result,
                     })
+
+                    # Auto-pause if all probes in this suite were rate-limited
+                    if session and pending:
+                        findings = result.get("findings", [])
+                        skipped = sum(
+                            1 for f in findings
+                            if "rate limited" in f.get("reasoning", "").lower()
+                        )
+                        if findings and skipped == len(findings):
+                            _AUTO_PAUSE_WAIT = 60
+                            session.pause(reason="rate_limit", retry_after=_AUTO_PAUSE_WAIT)
+                            yield _sse({
+                                "phase": "pipeline", "status": "paused",
+                                "reason": "rate_limit",
+                                "retry_after": _AUTO_PAUSE_WAIT,
+                                "session_id": session.session_id,
+                                "message": (
+                                    f"All probes rate-limited. Auto-resuming in {_AUTO_PAUSE_WAIT}s "
+                                    f"or click Resume now."
+                                ),
+                            })
+                            # Auto-resume after wait — or frontend can call /resume sooner
+                            async def _auto_resume(s=session, w=_AUTO_PAUSE_WAIT):
+                                await asyncio.sleep(w)
+                                if s.is_paused and s.paused_reason == "rate_limit":
+                                    s.resume()
+                            asyncio.ensure_future(_auto_resume())
+                            await session.wait_if_paused()
+                            yield _sse({
+                                "phase": "pipeline", "status": "resumed",
+                                "session_id": session.session_id,
+                            })
+
                 except Exception as exc:
                     err_str = str(exc)
                     is_timeout = "TimeoutError" in err_str or "timed out" in err_str.lower()
@@ -589,6 +652,10 @@ async def run_pipeline_in_sandbox(req: RedTeamRequest) -> AsyncIterator[str]:
                         ) if is_timeout else err_str,
                         "rate_limited": is_timeout,
                     })
+
+        # Pause checkpoint between execution → report
+        async for ev in _pause_checkpoint(session, "before_report"):
+            yield ev
 
         # ── Phase 4: Report (on orchestrator sandbox) ─────────────────────────
         yield _sse({"phase": "report", "status": "started"})

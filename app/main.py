@@ -19,6 +19,8 @@ import asyncio
 import json
 import logging
 import os
+import uuid
+from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -36,8 +38,57 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── In-memory report store ────────────────────────────────────────────────────
+# ─── In-memory stores ──────────────────────────────────────────────────────────
 _reports: dict[str, FinalReport] = {}
+
+
+# ─── Pipeline session (pause / resume) ────────────────────────────────────────
+
+class PipelineSession:
+    """
+    Holds the pause/resume state for one running pipeline.
+
+    The pipeline generator calls `wait_if_paused()` at safe checkpoints
+    (between phases, between suites).  External HTTP endpoints call
+    `pause()` / `resume()` to control flow.
+    """
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self._event = asyncio.Event()
+        self._event.set()          # not paused initially
+        self.status: str = "running"
+        self.paused_reason: Optional[str] = None
+        self.retry_after: Optional[int] = None
+
+    def pause(self, reason: str = "manual", retry_after: Optional[int] = None):
+        self._event.clear()
+        self.status = "paused"
+        self.paused_reason = reason
+        self.retry_after = retry_after
+        logger.info("Session %s paused (reason=%s, retry_after=%s)", self.session_id, reason, retry_after)
+
+    def resume(self):
+        self._event.set()
+        self.status = "running"
+        self.paused_reason = None
+        self.retry_after = None
+        logger.info("Session %s resumed", self.session_id)
+
+    def complete(self, status: str = "completed"):
+        self._event.set()
+        self.status = status
+
+    @property
+    def is_paused(self) -> bool:
+        return not self._event.is_set()
+
+    async def wait_if_paused(self):
+        """Block until the session is resumed. No-op if not paused."""
+        await self._event.wait()
+
+
+_sessions: dict[str, PipelineSession] = {}
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -67,18 +118,24 @@ _KEEPALIVE_INTERVAL = 5        # seconds between pings
 
 async def _stream_pipeline(req: RedTeamRequest):
     """
-    Wraps the sandbox pipeline with a background keepalive task.
+    Wraps the sandbox pipeline with a session (pause/resume) and a keepalive task.
 
-    A separate coroutine sends `: ping` SSE comment lines every 5 seconds
-    so the connection never goes silent long enough for Lovable (or any
-    intermediate proxy) to declare it dead.  Pipeline events are forwarded
-    via an asyncio.Queue so both producers share one consumer loop.
+    Emits `session_id` in the first event so the frontend can call
+    POST /session/{id}/pause and POST /session/{id}/resume.
     """
+    session_id = uuid.uuid4().hex
+    session = PipelineSession(session_id)
+    _sessions[session_id] = session
+
     queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     async def _pipeline_producer() -> None:
         try:
-            async for sse_str in run_pipeline_in_sandbox(req):
+            # First event carries the session_id so the frontend can wire up pause/resume
+            await queue.put(
+                f"data: {json.dumps({'phase': 'pipeline', 'status': 'started', 'session_id': session_id})}\n\n"
+            )
+            async for sse_str in run_pipeline_in_sandbox(req, session=session):
                 # Persist the final report server-side
                 if sse_str.startswith("data: "):
                     try:
@@ -93,6 +150,7 @@ async def _stream_pipeline(req: RedTeamRequest):
         except Exception as exc:
             logger.error("Pipeline producer error: %s", exc)
         finally:
+            session.complete("completed")
             await queue.put(None)  # sentinel — tells consumer to stop
 
     async def _keepalive_producer() -> None:
@@ -144,6 +202,49 @@ async def red_team(req: RedTeamRequest):
             "Connection": "keep-alive",
         },
     )
+
+
+# ─── Session control (pause / resume) ─────────────────────────────────────────
+
+@app.get("/session/{session_id}", summary="Get pipeline session status")
+async def get_session(session_id: str):
+    """Return current status of a running or completed pipeline session."""
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    return {
+        "session_id": session_id,
+        "status": session.status,
+        "paused_reason": session.paused_reason,
+        "retry_after": session.retry_after,
+    }
+
+
+@app.post("/session/{session_id}/pause", summary="Pause a running pipeline")
+async def pause_session(session_id: str):
+    """
+    Pause the pipeline at the next safe checkpoint (between phases or suites).
+    The pipeline will block until you call /resume.
+    """
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    if session.status not in ("running",):
+        raise HTTPException(status_code=409, detail=f"Session is '{session.status}', cannot pause.")
+    session.pause(reason="manual")
+    return {"session_id": session_id, "status": "paused"}
+
+
+@app.post("/session/{session_id}/resume", summary="Resume a paused pipeline")
+async def resume_session(session_id: str):
+    """Resume a pipeline that was paused manually or auto-paused due to rate limiting."""
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    if session.status != "paused":
+        raise HTTPException(status_code=409, detail=f"Session is '{session.status}', not paused.")
+    session.resume()
+    return {"session_id": session_id, "status": "resumed"}
 
 
 @app.get("/report/{report_id}", response_model=FinalReport, summary="Retrieve a stored report")
