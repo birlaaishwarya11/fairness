@@ -38,6 +38,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress "Unclosed client session" warnings from the Daytona SDK's internal
+# aiohttp usage — these are cosmetic GC warnings, not actionable errors.
+logging.getLogger("aiohttp.client").setLevel(logging.ERROR)
+logging.getLogger("aiohttp.connector").setLevel(logging.ERROR)
+
+# Global pipeline timeout (seconds). Kills the entire pipeline if it hasn't
+# completed within this window — prevents zombie pipelines on TrueFoundry.
+_PIPELINE_TIMEOUT = int(os.environ.get("PIPELINE_TIMEOUT_SECONDS", "900"))  # 15 min default
+
 # ─── In-memory stores ──────────────────────────────────────────────────────────
 _reports: dict[str, FinalReport] = {}
 
@@ -135,20 +144,32 @@ async def _stream_pipeline(req: RedTeamRequest):
             await queue.put(
                 f"data: {json.dumps({'phase': 'pipeline', 'status': 'started', 'session_id': session_id})}\n\n"
             )
-            async for sse_str in run_pipeline_in_sandbox(req, session=session):
-                # Persist the final report server-side
-                if sse_str.startswith("data: "):
-                    try:
-                        event = json.loads(sse_str[6:])
-                        if event.get("phase") == "report" and event.get("status") == "complete":
-                            report = FinalReport.model_validate(event["data"])
-                            _reports[report.report_id] = report
-                            logger.info("Stored report %s (target=%s)", report.report_id, req.target)
-                    except Exception:
-                        pass
-                await queue.put(sse_str)
+
+            async def _run():
+                async for sse_str in run_pipeline_in_sandbox(req, session=session):
+                    if sse_str.startswith("data: "):
+                        try:
+                            event = json.loads(sse_str[6:])
+                            if event.get("phase") == "report" and event.get("status") == "complete":
+                                report = FinalReport.model_validate(event["data"])
+                                _reports[report.report_id] = report
+                                logger.info("Stored report %s (target=%s)", report.report_id, req.target)
+                        except Exception:
+                            pass
+                    await queue.put(sse_str)
+
+            try:
+                await asyncio.wait_for(_run(), timeout=_PIPELINE_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.error("Pipeline timed out after %ds (session=%s)", _PIPELINE_TIMEOUT, session_id)
+                await queue.put(
+                    f"data: {json.dumps({'phase': 'error', 'status': 'error', 'error': f'Pipeline timed out after {_PIPELINE_TIMEOUT}s — the target model may be rate limiting heavily. Try again later or use a higher-quota API key.'})}\n\n"
+                )
         except Exception as exc:
             logger.error("Pipeline producer error: %s", exc)
+            await queue.put(
+                f"data: {json.dumps({'phase': 'error', 'status': 'error', 'error': str(exc)})}\n\n"
+            )
         finally:
             session.complete("completed")
             await queue.put(None)  # sentinel — tells consumer to stop

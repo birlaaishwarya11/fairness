@@ -130,8 +130,10 @@ async def _acode_run(sandbox, code: str, poll_interval: float = 3.0, max_wait: i
     pid = (getattr(pid_result, "output", "") or getattr(pid_result, "result", "") or "").strip()
 
     polls = int(max_wait / poll_interval)
-    for _ in range(polls):
+    elapsed = 0
+    for poll_n in range(polls):
         await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
         check_cmd = (
             f"if [ -f {done} ]; then echo done; "
             f"elif [ -n '{pid}' ] && ! kill -0 {pid} 2>/dev/null; then echo dead; "
@@ -140,10 +142,14 @@ async def _acode_run(sandbox, code: str, poll_interval: float = 3.0, max_wait: i
         check = await sandbox.process.exec(check_cmd, timeout=10)
         status = (getattr(check, "output", "") or getattr(check, "result", "") or "").strip()
         if status == "done":
+            logger.debug("_acode_run: done after %ds (uid=%s)", elapsed, uid)
             break
         if status == "dead":
-            logger.warning("_acode_run: background process (pid=%s) died without done-file — reading partial output", pid)
+            logger.warning("_acode_run: background process (pid=%s) died after %ds without done-file", pid, elapsed)
             break
+        # Log progress every 30s so operators can see the pipeline isn't frozen
+        if elapsed % 30 < poll_interval:
+            logger.info("_acode_run: still waiting %ds/%ds (uid=%s, pid=%s)", elapsed, max_wait, uid, pid)
     else:
         logger.warning("_acode_run: timed out after %ds waiting for %s", max_wait, done)
 
@@ -442,9 +448,13 @@ async def _run_suite_on_worker(
     sandbox,
 ) -> dict:
     """Run one suite on a pre-bootstrapped worker sandbox and return result dict."""
+    suite_name = suite_data.get("suite_name", "?")
+    sandbox_id = getattr(sandbox, "id", "?")
+    logger.info("Suite '%s' starting on sandbox %s", suite_name, sandbox_id)
     env = _env_setup(req)
     # max_wait=480: suite inner timeout=300s + 180s cleanup headroom after cancellation
     raw = await _acode_run(sandbox, _suite_code(req, suite_data, recon_data, env), max_wait=480)
+    logger.info("Suite '%s' finished on sandbox %s", suite_name, sandbox_id)
     return _parse_result(raw)
 
 
