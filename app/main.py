@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse
 
 from app.models.schemas import FinalReport, RedTeamRequest
 from app.sandbox.daytona_runner import run_pipeline_in_sandbox, _make_client
+from app.agent_redteam import router as _policy_redteam_router
 
 load_dotenv()
 
@@ -117,6 +118,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(_policy_redteam_router)
 
 
 # ─── Pipeline stream ──────────────────────────────────────────────────────────
